@@ -41,6 +41,8 @@ class FakeOpencode:
         self.info_path = "info"          # "info" | "server"
         self.reject_permissions = False  # True = create 拒绝 permissions 字段(next 版)
         self.break_stream_after: int | None = None  # SSE 写 N 条事件后断开
+        self.active_error: int | None = None      # /api/session/active 强制返回错误码
+        self.session_get_error: int | None = None  # GET /api/session/{id} 强制返回错误码
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -106,12 +108,20 @@ class FakeOpencode:
                         data = [s for s in data if (s.get("location") or {}).get("directory") == directory]
                     return self._send(200, {"data": data})
                 if path == "/api/session/active":
+                    if outer.active_error:
+                        return self._send(
+                            outer.active_error, {"_tag": "UnknownError", "message": "active query boom"}
+                        )
                     with outer.lock:
                         return self._send(200, {"data": dict(outer.active)})
                 if path == "/api/event":
                     return self._sse()
                 m = re.fullmatch(r"/api/session/([^/]+)", path)
                 if m:
+                    if outer.session_get_error:
+                        return self._send(
+                            outer.session_get_error, {"_tag": "UnknownError", "message": "get session boom"}
+                        )
                     with outer.lock:
                         sess = outer.sessions.get(m.group(1))
                     if not sess:
@@ -486,7 +496,11 @@ class OcctlTest(unittest.TestCase):
             with self.srv.lock:
                 self.srv.sessions[sid]["outcome"] = "succeeded"
                 self.srv.messages[sid] = [
-                    {"id": "m1", "type": "assistant", "content": [{"type": "text", "text": "recovered text"}]}
+                    {
+                        "id": "m1",
+                        "type": "assistant",
+                        "content": [{"type": "text", "text": "complete answer from messages"}],
+                    }
                 ]
             self.srv.emit("session.text.delta", sid, {"delta": "partial "})
 
@@ -495,7 +509,25 @@ class OcctlTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         out = json.loads(r.stdout)
         self.assertEqual(out["status"], "succeeded")
-        self.assertIn("partial", out["text"])
+        # 断流前只收到部分 delta;对账后必须以最终 assistant 消息校准文本
+        self.assertEqual(out["text"], "complete answer from messages")
+
+    def test_require_idle_fail_closed(self):
+        # active 查询出错(服务异常/端点缺失)时,不得放行
+        for code in (500, 404):
+            self.srv.active_error = code
+            r = self.cli("--password", "pw", "--json", "run", "--detach", "--require-idle", "--dir", "D:/w", "hi")
+            self.assertEqual(r.returncode, 1, f"code={code} stderr={r.stderr}")
+            self.assertIn("无法确认", r.stderr)
+        self.srv.active_error = None
+        r = self.cli("--password", "pw", "--json", "run", "--detach", "--require-idle", "--dir", "D:/w", "hi")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_create_permissions_unverified_warns(self):
+        self.srv.session_get_error = 500
+        r = self.cli("--password", "pw", "--json", "new", "--dir", "D:/w")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("无法回读验证", r.stderr)
 
     def test_missing_server_flag(self):
         r = run_cli("info")

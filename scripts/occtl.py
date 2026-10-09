@@ -240,16 +240,19 @@ def wait_session(client: httpx.Client, base_url: str, session_id: str) -> None:
 
 def create_session(
     client: httpx.Client, base_url: str, body: dict[str, Any]
-) -> tuple[Any, bool]:
-    """POST /api/session;返回 (会话, permissions 是否生效)。
+) -> tuple[Any, str]:
+    """POST /api/session;返回 (会话, 权限状态)。
 
-    next 版 create 不接受 permissions 字段(additionalProperties=false),
-    此时自动去掉该字段重试,并如实返回 False 供调用方提示。
+    权限状态:
+      "none"        —— 未请求权限(--no-allow-all)
+      "applied"     —— 请求了且回读确认生效
+      "not-applied" —— 该版本不接受该字段(已自动去掉重试)
+      "unverified"  —— 请求了但回读失败,无法确认是否生效
     """
     wants_perms = "permissions" in body
     if _shape(base_url).get("create") == "no-perms":
         body = {k: v for k, v in body.items() if k != "permissions"}
-        return unwrap(client.post("/api/session", json=body)), False
+        return unwrap(client.post("/api/session", json=body)), ("not-applied" if wants_perms else "none")
     try:
         sess = unwrap(client.post("/api/session", json=body))
     except CtlError as e:
@@ -258,27 +261,51 @@ def create_session(
         stripped = {k: v for k, v in body.items() if k != "permissions"}
         sess = unwrap(client.post("/api/session", json=stripped))
         _shape(base_url)["create"] = "no-perms"
-        return sess, False
-    if wants_perms:
-        # stable 版会把 permissions 回显在会话上;没有回显说明未生效
-        sid = (sess or {}).get("id", "")
-        if sid:
-            try:
-                stored = unwrap(client.get(f"/api/session/{sid}")) or {}
-                if not stored.get("permissions"):
-                    return sess, False
-            except Exception:
-                pass
-    return sess, wants_perms
+        return sess, "not-applied"
+    if not wants_perms:
+        return sess, "none"
+    # stable 版会把 permissions 回显在会话上;回读确认
+    sid = (sess or {}).get("id", "")
+    if not sid:
+        return sess, "unverified"
+    try:
+        stored = unwrap(client.get(f"/api/session/{sid}")) or {}
+    except Exception:
+        return sess, "unverified"
+    return sess, ("applied" if stored.get("permissions") else "not-applied")
+
+
+def _warn_permissions(status: str) -> None:
+    if status == "not-applied":
+        print(
+            "[occtl] 注意:该 opencode 版本未接受会话级 permissions,权限未注入;"
+            "请在目标机全局配置 permissions(allow)或接受交互式批准",
+            file=sys.stderr,
+        )
+    elif status == "unverified":
+        print(
+            "[occtl] 注意:无法回读验证会话权限是否生效;请在目标机确认 permissions,"
+            "或改用 --no-allow-all 后自行配置",
+            file=sys.stderr,
+        )
 
 
 def ensure_idle(client: httpx.Client, session_id: str | None) -> None:
-    """--require-idle:目标机没有其它正在执行的会话时才允许派发。"""
+    """--require-idle:目标机没有其它正在执行的会话时才允许派发。
+
+    fail-closed:查询失败(网络/认证/端点缺失/响应异常)一律拒绝派发,
+    绝不在"无法确认是否空闲"的情况下放行。
+    注意:检查与派发之间并非原子操作,这是尽力而为的防呆,不是分布式锁。
+    """
     try:
-        active = unwrap(client.get("/api/session/active")) or {}
-    except Exception:
-        return  # 该版本没有此端点则不阻塞
-    others = [sid for sid in active if sid != session_id]
+        active = unwrap(client.get("/api/session/active"))
+    except CtlError as e:
+        raise CtlError(f"--require-idle 无法确认目标机空闲({e});拒绝派发") from e
+    except httpx.HTTPError as e:
+        raise CtlError(f"--require-idle 无法确认目标机空闲(网络错误: {e});拒绝派发") from e
+    if active is not None and not isinstance(active, dict):
+        raise CtlError("--require-idle 无法确认目标机空闲(/api/session/active 返回异常);拒绝派发")
+    others = [sid for sid in (active or {}) if sid != session_id]
     if others:
         raise CtlError(
             f"目标机已有正在执行的会话: {', '.join(others)};"
@@ -290,7 +317,7 @@ def recover_session(client: httpx.Client, session_id: str, result: dict[str, Any
     """事件流断开后对账会话真实状态。
 
     返回 "succeeded"/"failed"/"interrupted"/"running",或 None(无法判定)。
-    成功时顺带从消息里补回最终助手文本。
+    只要拿得到最终 assistant 消息,就用它**校准**正文——断流前可能只收到部分 delta。
     """
     outcome = None
     try:
@@ -306,21 +333,21 @@ def recover_session(client: httpx.Client, session_id: str, result: dict[str, Any
         except Exception:
             pass
         return None
-    if outcome == "succeeded" and not result.get("text"):
-        try:
-            msgs = unwrap(
-                client.get(f"/api/session/{session_id}/message", params={"limit": 20, "order": "desc"})
-            ) or []
-            for m in msgs:
-                if m.get("type") == "assistant":
-                    text = "".join(
-                        p.get("text", "") for p in (m.get("content") or []) if p.get("type") == "text"
-                    )
-                    if text:
-                        result["text"] = text
-                        break
-        except Exception:
-            pass
+    # 以最终 assistant 消息校准文本(可能比已累积的 delta 更完整)
+    try:
+        msgs = unwrap(
+            client.get(f"/api/session/{session_id}/message", params={"limit": 20, "order": "desc"})
+        ) or []
+        for m in msgs:
+            if m.get("type") == "assistant":
+                text = "".join(
+                    p.get("text", "") for p in (m.get("content") or []) if p.get("type") == "text"
+                )
+                if text:
+                    result["text"] = text
+                    break
+    except Exception:
+        pass
     return outcome
 
 
@@ -415,11 +442,11 @@ def cmd_servers(args: argparse.Namespace) -> int:
     registry = load_registry(path)
     rows = []
     for name, entry in sorted(registry.items()):
-        row: dict[str, Any] = {"name": name, "url": entry.get("url", ""), "online": None}
+        row: dict[str, Any] = {"name": name, "url": str(entry.get("url", "")).rstrip("/"), "online": None}
         if args.probe:
             try:
-                with make_client(str(entry.get("url", "")), str(entry.get("password", ""))) as client:
-                    unwrap(client.get("/api/info"))
+                with make_client(row["url"], str(entry.get("password", ""))) as client:
+                    server_info(client, row["url"])
                 row["online"] = True
             except Exception:
                 row["online"] = False
@@ -504,10 +531,8 @@ def cmd_new(args: argparse.Namespace) -> int:
     if not args.no_allow_all:
         body["permissions"] = [{"action": "*", "resource": "*", "effect": "allow"}]
     with make_client(base, pw) as client:
-        sess, perms_ok = create_session(client, base, body)
-    if not args.no_allow_all and not perms_ok:
-        print("[occtl] 注意:该 opencode 版本未接受会话级 permissions,权限未注入;"
-              "请在目标机全局配置 permissions(allow)或接受交互式批准", file=sys.stderr)
+        sess, perms = create_session(client, base, body)
+    _warn_permissions(perms)
     if args.json:
         print_json(sess)
     else:
@@ -663,10 +688,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         with make_client(base, pw) as client:
             if args.require_idle:
                 ensure_idle(client, None)
-            sess, perms_ok = create_session(client, base, body)
-        if not args.no_allow_all and not perms_ok:
-            print("[occtl] 注意:该 opencode 版本未接受会话级 permissions,权限未注入;"
-                  "请在目标机全局配置 permissions(allow)或接受交互式批准", file=sys.stderr)
+            sess, perms = create_session(client, base, body)
+        _warn_permissions(perms)
         session_id = sess.get("id", "")
         if not args.json:
             print(f"[occtl] session {session_id}", file=sys.stderr)
@@ -891,7 +914,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("session_id")
     p.add_argument("text", nargs="+")
     p.add_argument("--wait", action="store_true", help="流式输出并等待终态")
-    p.add_argument("--require-idle", action="store_true", help="目标机有其它会话在跑时拒绝派发")
+    p.add_argument("--require-idle", action="store_true", help="目标机有其它会话在跑时拒绝派发(fail-closed;尽力检查,非严格锁)")
     p.add_argument("--timeout", type=float, help="整体超时秒数")
     p.add_argument("--read-timeout", type=float, default=DEFAULT_READ_TIMEOUT)
     p.add_argument("--show-reasoning", action="store_true")
@@ -902,7 +925,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", help="新建会话时的项目目录")
     p.add_argument("--session", help="续用已有会话;给了就不再新建")
     p.add_argument("--detach", action="store_true", help="派发后立即返回(不等执行;用 ps/messages/wait 跟踪)")
-    p.add_argument("--require-idle", action="store_true", help="目标机有其它会话在跑时拒绝派发")
+    p.add_argument("--require-idle", action="store_true", help="目标机有其它会话在跑时拒绝派发(fail-closed;尽力检查,非严格锁)")
     p.add_argument("--title")
     p.add_argument("--agent")
     p.add_argument("--model", help="provider/model[#variant]")

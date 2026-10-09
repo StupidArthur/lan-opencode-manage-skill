@@ -73,18 +73,20 @@ python3.11 scripts/occtl.py --server pc-01 run --dir D:/work/project-a "任务�
 | 服务信息 | `GET /api/info` | `GET /api/server` | 先试 `/api/info`,404 时自动回退 |
 | create 的 `permissions` | 支持并回显 | 不接受该字段 | 被拒时自动去掉重试,并在 stderr 提醒 |
 
-另:事件流被掐断时,`run/prompt --wait` 会**自动向服务器对账**会话 `outcome` 并补回最终文本,不会把已完成的任务误报成丢失。
+另:事件流被掐断时,`run/prompt --wait` 会**自动向服务器对账**会话 `outcome`,并**以最终 assistant 消息校准正文**(断流前可能只收到部分 delta);`--require-idle` 查询失败时 **fail-closed** 拒绝派发。
+
+**判定基准**(按优先级):运行中服务器的 `/openapi.json` → 官方发布版 spec → 真机 E2E → dev 文档(仅作前瞻兼容参考)。
 
 ## 测试
 
 ```sh
-# 单元测试(假服务器,默认):18 个用例
-python3.11 -m unittest -v scripts/test_occtl.py
+# 单元测试(假服务器,默认):20 个用例
+python3.11 -m unittest scripts.test_occtl -v
 
 # 真实服务器集成测试(默认跳过):
 OPENCODE_PASSWORD=$PW opencode serve --hostname 127.0.0.1 --port 18995 &
 OCCTL_TEST_SERVER=http://127.0.0.1:18995 OCCTL_TEST_PASSWORD=$PW \
-    python3.11 -m unittest test_integration -v
+    python3.11 -m unittest scripts.test_integration -v
 # 远程机器时加 OCCTL_TEST_DIR=D:/work/project-a 指定目标机上的目录
 ```
 

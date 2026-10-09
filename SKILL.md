@@ -143,10 +143,10 @@ opencode web API 包含 shell / pty / 文件读写接口,**等价于该机器的
 ## 自检
 
 ```sh
-# 单元测试(假 opencode + SSE,不需要真实环境)
-python3.11 -m unittest -v scripts/test_occtl.py
+# 单元测试(假 opencode + SSE,不需要真实环境;20 个用例)
+python3.11 -m unittest scripts.test_occtl -v
 
-# 真实服务器集成测试(起一个 opencode serve 后)
+# 真实服务器集成测试(起一个 opencode serve 后;默认跳过)
 OCCTL_TEST_SERVER=http://127.0.0.1:18995 OCCTL_TEST_PASSWORD=$PW \
-    python3.11 -m unittest test_integration -v
+    python3.11 -m unittest scripts.test_integration -v
 ```
