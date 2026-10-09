@@ -67,6 +67,8 @@ python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "把改�
 - 非 `--json` 时:正文流式打印到 stdout,状态行打到 stderr;`--json` 时只输出最终 JSON(含 `text`)。
 - 退出码:`0` 成功 · `1` 用法/HTTP 错误 · `2` 会话执行失败 · `3` 超时(已自动 interrupt,会话可续用)。
 - 新建会话默认注入"全部允许"权限,headless 不会卡权限询问;需要收紧时用 `--no-allow-all` 并自行在目标机配置 `permissions`。
+- **版本兼容**:自动适配 opencode v2.0.x(stable)与 dev/下一版两套 API 形状——prompt 请求体(`text` ↔ `prompt.text`)、wait 路径(experimental ↔ 正式)、服务信息(`/api/info` ↔ `/api/server`)、create 权限字段(新版不支持时自动去掉并在 stderr 提醒)。无需配置。
+- **断流对账**:事件流被掐断时,自动查会话 `outcome` 并补回最终文本,不会把已完成的任务误报成丢失(见"盯梢")。
 
 ## 管理规程(AI 当调度器)
 
@@ -90,9 +92,11 @@ python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "把改�
 ```sh
 python3.11 scripts/occtl.py ps                                   # 1) 先看哪台空闲
 python3.11 scripts/occtl.py --server pc-01 --json run --detach \
-    --dir D:/work/project-a "任务文本"                            # 2) 派发,拿 sessionID
+    --require-idle --dir D:/work/project-a "任务文本"             # 2) 派发,拿 sessionID
 # 3) 立刻把 {jobId, pc, sessionID, dir, prompt} 写进台账
 ```
+
+`--require-idle` 是程序级防呆:派发前先查目标机 `/api/session/active`,有其它会话在跑就直接拒绝(exit 1),比"靠自觉"硬一层。
 
 ### 盯梢
 
@@ -103,6 +107,8 @@ python3.11 scripts/occtl.py --server pc-01 --json messages ses_x --limit 5
 python3.11 scripts/occtl.py --server pc-01 run --session ses_x "..."  # 需要时续轮
 ```
 
+`run/prompt --wait` 的事件流被掐断时,occtl 会**自动向服务器对账**:查会话 `outcome`(succeeded/failed/interrupted)并补回最终文本;若仍在跑会明确提示用 `wait`/`messages` 跟踪。不需要重跑任务。
+
 ### 验收与收尾(逐任务)
 
 1. 终态为 succeeded 后,在**同一目录**开验收会话:`run --dir <同目录> "git status 和 git diff,把变更摘要和风险点列出来"`(目标机有自己的 git 身份,不要替它管理账号);
@@ -111,7 +117,7 @@ python3.11 scripts/occtl.py --server pc-01 run --session ses_x "..."  # 需要�
 
 ### 并发纪律(重要)
 
-- **每台 PC 同时最多 1 个干活任务**:web 模式没有队列,靠这条纪律约束;派活前先 `ps` 看目标机 `running` 数;
+- **每台 PC 同时最多 1 个干活任务**:web 模式没有队列,靠这条纪律约束;派活先 `ps` 看目标机 `running` 数,并给 `run --detach` 加 `--require-idle`(程序会拒绝在有任务执行时派发);
 - 不同 PC 可并行;同一 PC 的第二个任务等前一个终态后再派;
 - 派发成功的第一步就是写台账——sessionID 丢了就等于任务丢了。
 
@@ -132,3 +138,15 @@ opencode web API 包含 shell / pty / 文件读写接口,**等价于该机器的
 | `HTTP 404 SessionNotFoundError` | sessionID 不属于该服务器(被删或串机) |
 | `事件流 Ns 无数据` | 网络抖动或目标机卡死;已自动 interrupt,可 `run --session` 续 |
 | `缺少依赖 httpx` | `python3.11 -m pip install httpx` |
+| 目标机忙时被 `--require-idle` 拒绝 | 正常防呆;等 `ps` 里目标机 `running:0` 再派,或去掉开关自行承担并发 |
+
+## 自检
+
+```sh
+# 单元测试(假 opencode + SSE,不需要真实环境)
+python3.11 -m unittest -v scripts/test_occtl.py
+
+# 真实服务器集成测试(起一个 opencode serve 后)
+OCCTL_TEST_SERVER=http://127.0.0.1:18995 OCCTL_TEST_PASSWORD=$PW \
+    python3.11 -m unittest test_integration -v
+```

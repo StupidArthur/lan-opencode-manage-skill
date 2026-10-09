@@ -3,8 +3,9 @@
 在局域网里遥控多台机器上的 **opencode**(v2,web 模式)的 agent skill + Python CLI。
 
 - `SKILL.md` —— 可被 opencode 自动发现的 skill:教 agent 把整个机队当资源池来调度(派活 / 盯梢 / 验收 / 并发纪律)。
-- `scripts/occtl.py` —— Python 3.11 + httpx 单文件 CLI,封装 opencode v2 HTTP API:会话管理、prompt、SSE 事件流。
-- `scripts/test_occtl.py` —— 12 个用例,内建假 opencode 服务器(含 SSE),无需真实 opencode。
+- `scripts/occtl.py` —— Python 3.11 + httpx 单文件 CLI,封装 opencode HTTP API:会话管理、prompt、SSE 事件流、断流对账。
+- `scripts/test_occtl.py` —— 18 个单元用例,内建假 opencode 服务器(含 SSE),无需真实环境。
+- `scripts/test_integration.py` —— 真实服务器集成测试(环境变量开关,默认跳过)。
 
 ## 目标机准备(每台 PC,一次)
 
@@ -49,21 +50,42 @@ python3.11 scripts/occtl.py --server http://192.168.1.11:4096 --password "$PW" p
 cp references/servers.example.json occtl-servers.json
 python3.11 scripts/occtl.py ps
 
-# 派活(不阻塞,拿 sessionID)
-python3.11 scripts/occtl.py --server pc-01 --json run --detach --dir D:/work/project-a "任务…"
+# 派活(不阻塞,拿 sessionID;--require-idle 让程序拒绝在有任务执行的机器上再派)
+python3.11 scripts/occtl.py --server pc-01 --json run --detach --require-idle \
+    --dir D:/work/project-a "任务…"
 
 # 流式跑完(等终态)
 python3.11 scripts/occtl.py --server pc-01 run --dir D:/work/project-a "任务…"
 ```
 
-命令:`info / servers / ps / ls / new / get / rm / messages / run(--detach) / prompt(--wait) / wait / interrupt / events`,全部支持 `--json`。
+命令:`info / servers / ps / ls / new / get / rm / messages / run(--detach --require-idle) / prompt(--wait) / wait / interrupt / events`,全部支持 `--json`。
 
 退出码:`0` 成功 · `1` 用法/HTTP 错误 · `2` 会话执行失败 · `3` 超时(已自动 interrupt,会话可续用)。
+
+## 版本兼容
+
+自动适配 opencode 的 stable(v2.0.x)与 dev/下一版两套 API 形状,无需配置:
+
+| 能力 | stable(v2.0.x) | dev / 下一版 | occtl 行为 |
+|---|---|---|---|
+| prompt 请求体 | `{"text": ...}` | `{"prompt": {"text": ...}}` | 先发 stable 形状,400 时自动换下一版形状 |
+| wait 路径 | `/api/experimental/session/{id}/wait` | `/api/session/{id}/wait` | 先试 experimental,404 时自动回退 |
+| 服务信息 | `GET /api/info` | `GET /api/server` | 先试 `/api/info`,404 时自动回退 |
+| create 的 `permissions` | 支持并回显 | 不接受该字段 | 被拒时自动去掉重试,并在 stderr 提醒 |
+
+另:事件流被掐断时,`run/prompt --wait` 会**自动向服务器对账**会话 `outcome` 并补回最终文本,不会把已完成的任务误报成丢失。
 
 ## 测试
 
 ```sh
+# 单元测试(假服务器,默认):18 个用例
 python3.11 -m unittest -v scripts/test_occtl.py
+
+# 真实服务器集成测试(默认跳过):
+OPENCODE_PASSWORD=$PW opencode serve --hostname 127.0.0.1 --port 18995 &
+OCCTL_TEST_SERVER=http://127.0.0.1:18995 OCCTL_TEST_PASSWORD=$PW \
+    python3.11 -m unittest test_integration -v
+# 远程机器时加 OCCTL_TEST_DIR=D:/work/project-a 指定目标机上的目录
 ```
 
 ## 安全

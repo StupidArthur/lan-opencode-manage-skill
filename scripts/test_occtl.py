@@ -30,10 +30,17 @@ class FakeOpencode:
         self.sessions: dict[str, dict] = {}
         self.active: dict[str, dict] = {}
         self.prompts: list[dict] = []
+        self.messages: dict[str, list] = {}
         self.subs: list[queue.Queue] = []
         self.interrupts = 0
         self.lock = threading.Lock()
         self.on_prompt = None
+        # 版本形状开关(默认 stable/v2.0.x 行为)
+        self.prompt_shape = "flat"       # "flat" | "nested"
+        self.wait_path = "experimental"  # "experimental" | "stable"
+        self.info_path = "info"          # "info" | "server"
+        self.reject_permissions = False  # True = create 拒绝 permissions 字段(next 版)
+        self.break_stream_after: int | None = None  # SSE 写 N 条事件后断开
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -84,7 +91,13 @@ class FakeOpencode:
                 path = self._path()
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 if path == "/api/info":
+                    if outer.info_path == "server":
+                        return self._send(404, {"_tag": "NotFoundError", "message": "no such route"})
                     return self._send(200, {"version": "fake-1", "pid": 1, "urls": []})
+                if path == "/api/server":
+                    if outer.info_path == "info":
+                        return self._send(404, {"_tag": "NotFoundError", "message": "no such route"})
+                    return self._send(200, {"urls": [outer.url]})
                 if path == "/api/session":
                     with outer.lock:
                         data = list(outer.sessions.values())
@@ -106,7 +119,9 @@ class FakeOpencode:
                     return self._send(200, {"data": sess})
                 m = re.fullmatch(r"/api/session/([^/]+)/message", path)
                 if m:
-                    return self._send(200, {"data": [], "cursor": {}})
+                    with outer.lock:
+                        data = outer.messages.get(m.group(1))
+                    return self._send(200, {"data": data if data is not None else [], "cursor": {}})
                 return self._send(404, {"_tag": "NotFoundError", "message": path})
 
             # ---------- POST ----------
@@ -116,6 +131,8 @@ class FakeOpencode:
                 path = self._path()
                 if path == "/api/session":
                     body = self._read_json()
+                    if outer.reject_permissions and "permissions" in body:
+                        return self._send(400, {"_tag": "InvalidRequestError", "message": "unknown field: permissions"})
                     with outer.lock:
                         sid = f"ses_test_{len(outer.sessions) + 1}"
                         sess = {
@@ -124,22 +141,30 @@ class FakeOpencode:
                             "location": body.get("location") or {"directory": ""},
                             "time": {"created": 1, "updated": 1},
                         }
+                        if body.get("permissions"):
+                            sess["permissions"] = body["permissions"]
                         outer.sessions[sid] = sess
                     return self._send(200, {"data": sess})
                 m = re.fullmatch(r"/api/session/([^/]+)/prompt", path)
                 if m:
                     sid = m.group(1)
                     body = self._read_json()
+                    if outer.prompt_shape == "nested":
+                        if "prompt" not in body:
+                            return self._send(400, {"_tag": "InvalidRequestError", "message": "prompt is required"})
+                    elif "text" not in body:
+                        return self._send(400, {"_tag": "InvalidRequestError", "message": "text is required"})
+                    prompt_text = (body.get("prompt") or {}).get("text", "") if "prompt" in body else body.get("text", "")
                     with outer.lock:
                         exists = sid in outer.sessions
                         if exists:
-                            outer.prompts.append({"sessionID": sid, "text": body.get("text", "")})
+                            outer.prompts.append({"sessionID": sid, "body": body})
                     if not exists:
                         return self._send(404, {"_tag": "SessionNotFoundError", "message": "not found"})
                     self._send(200, {"data": {"id": "msg_1", "sessionID": sid, "type": "user", "delivery": "steer"}})
                     cb = outer.on_prompt
                     if cb:
-                        threading.Thread(target=cb, args=(sid, body.get("text", "")), daemon=True).start()
+                        threading.Thread(target=cb, args=(sid, prompt_text), daemon=True).start()
                     return
                 m = re.fullmatch(r"/api/session/([^/]+)/interrupt", path)
                 if m:
@@ -149,6 +174,13 @@ class FakeOpencode:
                     return self._send(200, {"interrupted": True})
                 m = re.fullmatch(r"/api/experimental/session/([^/]+)/wait", path)
                 if m:
+                    if outer.wait_path == "stable":
+                        return self._send(404, {"_tag": "NotFoundError", "message": "no such route"})
+                    return self._send(204)
+                m = re.fullmatch(r"/api/session/([^/]+)/wait", path)
+                if m:
+                    if outer.wait_path == "experimental":
+                        return self._send(404, {"_tag": "NotFoundError", "message": "no such route"})
                     return self._send(204)
                 return self._send(404, {"_tag": "NotFoundError", "message": path})
 
@@ -174,12 +206,18 @@ class FakeOpencode:
                     outer.subs.append(q)
                 try:
                     self._write_event({"id": "evt_0", "type": "server.connected", "data": {}})
+                    if outer.break_stream_after == 0:
+                        return
+                    written = 0
                     while True:
                         try:
                             ev = q.get(timeout=30)
                         except queue.Empty:
                             break
                         self._write_event(ev)
+                        written += 1
+                        if outer.break_stream_after is not None and written >= outer.break_stream_after:
+                            return  # 模拟事件流被掐断(不发送后续终态事件)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 finally:
@@ -385,6 +423,79 @@ class OcctlTest(unittest.TestCase):
         self.assertEqual(out["status"], "dispatched")
         self.assertTrue(out["sessionID"].startswith("ses_"))
         self.assertEqual(self.srv.prompt_count(), 1)
+
+    # ---------- 版本兼容(stable v2.0.x ↔ dev/下一版) ----------
+    def test_prompt_nested_fallback(self):
+        self.srv.prompt_shape = "nested"
+
+        def on_prompt(sid, text):
+            self.srv.emit("session.text.delta", sid, {"delta": "nested ok"})
+            self.srv.emit("session.execution.succeeded", sid)
+
+        self.srv.on_prompt = on_prompt
+        r = self.cli("--password", "pw", "--json", "run", "--dir", "D:/w", "--timeout", "10", "hi")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["status"], "succeeded")
+        self.assertEqual(out["text"], "nested ok")
+        with self.srv.lock:
+            body = self.srv.prompts[0]["body"]
+        self.assertIn("prompt", body)
+        self.assertNotIn("text", body)
+
+    def test_wait_stable_fallback(self):
+        self.srv.wait_path = "stable"
+        r = self.cli("--password", "pw", "--json", "wait", "ses_whatever")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["status"], "idle")
+
+    def test_info_server_fallback(self):
+        self.srv.info_path = "server"
+        r = self.cli("--password", "pw", "--json", "info")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("urls", json.loads(r.stdout))
+
+    def test_create_permissions_rejected_warns(self):
+        self.srv.reject_permissions = True
+        r = self.cli("--password", "pw", "--json", "new", "--dir", "D:/w")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("permissions", r.stderr)
+        self.assertTrue(json.loads(r.stdout)["id"])
+
+    def test_require_idle_refuses_when_busy(self):
+        with self.srv.lock:
+            self.srv.sessions["ses_busy"] = {
+                "id": "ses_busy",
+                "location": {"directory": "D:/other"},
+                "time": {"created": 1, "updated": 1},
+            }
+            self.srv.active["ses_busy"] = {"type": "running"}
+        r = self.cli("--password", "pw", "--json", "run", "--detach", "--require-idle", "--dir", "D:/w", "hi")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ses_busy", r.stderr)
+
+        with self.srv.lock:
+            self.srv.active.clear()
+        r2 = self.cli("--password", "pw", "--json", "run", "--detach", "--require-idle", "--dir", "D:/w", "hi")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+
+    def test_stream_break_recovers_state(self):
+        self.srv.break_stream_after = 1
+
+        def on_prompt(sid, text):
+            with self.srv.lock:
+                self.srv.sessions[sid]["outcome"] = "succeeded"
+                self.srv.messages[sid] = [
+                    {"id": "m1", "type": "assistant", "content": [{"type": "text", "text": "recovered text"}]}
+                ]
+            self.srv.emit("session.text.delta", sid, {"delta": "partial "})
+
+        self.srv.on_prompt = on_prompt
+        r = self.cli("--password", "pw", "--json", "run", "--dir", "D:/w", "--timeout", "10", "hi")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        out = json.loads(r.stdout)
+        self.assertEqual(out["status"], "succeeded")
+        self.assertIn("partial", out["text"])
 
     def test_missing_server_flag(self):
         r = run_cli("info")

@@ -158,6 +158,173 @@ def interrupt_quietly(client: httpx.Client, session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 版本兼容层
+# ---------------------------------------------------------------------------
+# opencode v2.0.x(stable)与 dev/下一版存在 API 形状差异:
+#
+#   能力            stable                         next(dev)
+#   prompt 请求体   {"text": ...}                  {"prompt": {"text": ...}}
+#   wait 路径       /api/experimental/session/...  /api/session/{id}/wait
+#   服务信息        GET /api/info                  GET /api/server
+#   create 权限     permissions 字段被接受并回显    不接受该字段
+#
+# 这里按"先 stable 后回退"探测,并按 base_url 缓存探测结果;两种版本都能跑。
+
+_SHAPES: dict[str, dict[str, str]] = {}
+
+
+def _shape(base_url: str) -> dict[str, str]:
+    return _SHAPES.setdefault(base_url, {})
+
+
+def _is_validation_error(exc: CtlError) -> bool:
+    msg = str(exc)
+    return "HTTP 400" in msg or "HTTP 422" in msg
+
+
+def server_info(client: httpx.Client, base_url: str) -> Any:
+    """GET /api/info;404 时回退 GET /api/server(next 版)。"""
+    if _shape(base_url).get("info") == "server":
+        return unwrap(client.get("/api/server"))
+    try:
+        return unwrap(client.get("/api/info"))
+    except CtlError as e:
+        if "HTTP 404" not in str(e):
+            raise
+    info = unwrap(client.get("/api/server"))
+    _shape(base_url)["info"] = "server"
+    return info
+
+
+def post_prompt(
+    client: httpx.Client,
+    base_url: str,
+    session_id: str,
+    text: str,
+    *,
+    delivery: str | None = None,
+    resume: bool | None = None,
+) -> Any:
+    """POST prompt,自动兼容 flat(text)与 nested(prompt.text)两种请求体。"""
+    extra: dict[str, Any] = {}
+    if delivery:
+        extra["delivery"] = delivery
+    if resume is not None:
+        extra["resume"] = resume
+    if _shape(base_url).get("prompt") == "nested":
+        return unwrap(client.post(f"/api/session/{session_id}/prompt", json={"prompt": {"text": text}, **extra}))
+    try:
+        return unwrap(client.post(f"/api/session/{session_id}/prompt", json={"text": text, **extra}))
+    except CtlError as e:
+        if not _is_validation_error(e):
+            raise
+    data = unwrap(client.post(f"/api/session/{session_id}/prompt", json={"prompt": {"text": text}, **extra}))
+    _shape(base_url)["prompt"] = "nested"
+    return data
+
+
+def wait_session(client: httpx.Client, base_url: str, session_id: str) -> None:
+    """POST wait,自动兼容 experimental 与 stable 两种路径。"""
+    if _shape(base_url).get("wait") == "stable":
+        unwrap(client.post(f"/api/session/{session_id}/wait"))
+        return
+    try:
+        unwrap(client.post(f"/api/experimental/session/{session_id}/wait"))
+        return
+    except CtlError as e:
+        if "HTTP 404" not in str(e):
+            raise
+    unwrap(client.post(f"/api/session/{session_id}/wait"))
+    _shape(base_url)["wait"] = "stable"
+
+
+def create_session(
+    client: httpx.Client, base_url: str, body: dict[str, Any]
+) -> tuple[Any, bool]:
+    """POST /api/session;返回 (会话, permissions 是否生效)。
+
+    next 版 create 不接受 permissions 字段(additionalProperties=false),
+    此时自动去掉该字段重试,并如实返回 False 供调用方提示。
+    """
+    wants_perms = "permissions" in body
+    if _shape(base_url).get("create") == "no-perms":
+        body = {k: v for k, v in body.items() if k != "permissions"}
+        return unwrap(client.post("/api/session", json=body)), False
+    try:
+        sess = unwrap(client.post("/api/session", json=body))
+    except CtlError as e:
+        if not wants_perms or not _is_validation_error(e):
+            raise
+        stripped = {k: v for k, v in body.items() if k != "permissions"}
+        sess = unwrap(client.post("/api/session", json=stripped))
+        _shape(base_url)["create"] = "no-perms"
+        return sess, False
+    if wants_perms:
+        # stable 版会把 permissions 回显在会话上;没有回显说明未生效
+        sid = (sess or {}).get("id", "")
+        if sid:
+            try:
+                stored = unwrap(client.get(f"/api/session/{sid}")) or {}
+                if not stored.get("permissions"):
+                    return sess, False
+            except Exception:
+                pass
+    return sess, wants_perms
+
+
+def ensure_idle(client: httpx.Client, session_id: str | None) -> None:
+    """--require-idle:目标机没有其它正在执行的会话时才允许派发。"""
+    try:
+        active = unwrap(client.get("/api/session/active")) or {}
+    except Exception:
+        return  # 该版本没有此端点则不阻塞
+    others = [sid for sid in active if sid != session_id]
+    if others:
+        raise CtlError(
+            f"目标机已有正在执行的会话: {', '.join(others)};"
+            f"--require-idle 拒绝派发(等它结束,或去掉该开关)"
+        )
+
+
+def recover_session(client: httpx.Client, session_id: str, result: dict[str, Any]) -> str | None:
+    """事件流断开后对账会话真实状态。
+
+    返回 "succeeded"/"failed"/"interrupted"/"running",或 None(无法判定)。
+    成功时顺带从消息里补回最终助手文本。
+    """
+    outcome = None
+    try:
+        sess = unwrap(client.get(f"/api/session/{session_id}")) or {}
+        outcome = sess.get("outcome")
+    except Exception:
+        pass
+    if not outcome:
+        try:
+            active = unwrap(client.get("/api/session/active")) or {}
+            if session_id in active:
+                return "running"
+        except Exception:
+            pass
+        return None
+    if outcome == "succeeded" and not result.get("text"):
+        try:
+            msgs = unwrap(
+                client.get(f"/api/session/{session_id}/message", params={"limit": 20, "order": "desc"})
+            ) or []
+            for m in msgs:
+                if m.get("type") == "assistant":
+                    text = "".join(
+                        p.get("text", "") for p in (m.get("content") or []) if p.get("type") == "text"
+                    )
+                    if text:
+                        result["text"] = text
+                        break
+        except Exception:
+            pass
+    return outcome
+
+
+# ---------------------------------------------------------------------------
 # SSE 事件流
 # ---------------------------------------------------------------------------
 
@@ -226,14 +393,20 @@ def fmt_session(s: dict[str, Any]) -> str:
 def cmd_info(args: argparse.Namespace) -> int:
     base, pw = resolve_server(args)
     with make_client(base, pw) as client:
-        info = unwrap(client.get("/api/info"))
+        info = server_info(client, base) or {}
     if args.json:
         print_json(info)
-    else:
-        print(f"url      {base}")
-        print(f"version  {info.get('version')}")
-        print(f"pid      {info.get('pid')}")
-        print(f"urls     {', '.join(info.get('urls', []))}")
+        return EXIT_OK
+    print(f"url      {base}")
+    if info.get("version") is not None:
+        print(f"version  {info['version']}")
+    if info.get("pid") is not None:
+        print(f"pid      {info['pid']}")
+    urls = info.get("urls") or info.get("url") or []
+    if isinstance(urls, str):
+        urls = [urls]
+    if urls:
+        print(f"urls     {', '.join(str(u) for u in urls)}")
     return EXIT_OK
 
 
@@ -331,7 +504,10 @@ def cmd_new(args: argparse.Namespace) -> int:
     if not args.no_allow_all:
         body["permissions"] = [{"action": "*", "resource": "*", "effect": "allow"}]
     with make_client(base, pw) as client:
-        sess = unwrap(client.post("/api/session", json=body))
+        sess, perms_ok = create_session(client, base, body)
+    if not args.no_allow_all and not perms_ok:
+        print("[occtl] 注意:该 opencode 版本未接受会话级 permissions,权限未注入;"
+              "请在目标机全局配置 permissions(allow)或接受交互式批准", file=sys.stderr)
     if args.json:
         print_json(sess)
     else:
@@ -402,19 +578,20 @@ def cmd_messages(args: argparse.Namespace) -> int:
 def cmd_wait(args: argparse.Namespace) -> int:
     base, pw = resolve_server(args)
     with make_client(base, pw, read=args.timeout or DEFAULT_READ_TIMEOUT) as client:
-        resp = client.post(f"/api/experimental/session/{args.session_id}/wait")
-        if resp.status_code >= 300:
-            unwrap(resp)
-    print("idle")
+        wait_session(client, base, args.session_id)
+    if args.json:
+        print_json({"sessionID": args.session_id, "status": "idle"})
+    else:
+        print("idle")
     return EXIT_OK
 
 
 def cmd_interrupt(args: argparse.Namespace) -> int:
     base, pw = resolve_server(args)
     with make_client(base, pw) as client:
-        data = unwrap(client.post(f"/api/session/{args.session_id}/interrupt", params={"resume": "true" if args.resume else "false"}))
+        unwrap(client.post(f"/api/session/{args.session_id}/interrupt", params={"resume": "true" if args.resume else "false"}))
     if args.json:
-        print_json(data)
+        print_json({"sessionID": args.session_id, "interrupted": True})
     else:
         print("interrupted")
     return EXIT_OK
@@ -455,11 +632,13 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     base, pw = resolve_server(args)
     if not args.wait:
         with make_client(base, pw) as client:
-            item = unwrap(client.post(f"/api/session/{args.session_id}/prompt", json={"text": text}))
+            if args.require_idle:
+                ensure_idle(client, args.session_id)
+            item = post_prompt(client, base, args.session_id, text)
         if args.json:
             print_json(item)
         else:
-            print(f"queued {item.get('id', '')}")
+            print(f"queued {(item or {}).get('id', '')}")
         return EXIT_OK
     return stream_turn(base, pw, args.session_id, text, args)
 
@@ -482,14 +661,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         if not args.no_allow_all:
             body["permissions"] = [{"action": "*", "resource": "*", "effect": "allow"}]
         with make_client(base, pw) as client:
-            sess = unwrap(client.post("/api/session", json=body))
+            if args.require_idle:
+                ensure_idle(client, None)
+            sess, perms_ok = create_session(client, base, body)
+        if not args.no_allow_all and not perms_ok:
+            print("[occtl] 注意:该 opencode 版本未接受会话级 permissions,权限未注入;"
+                  "请在目标机全局配置 permissions(allow)或接受交互式批准", file=sys.stderr)
         session_id = sess.get("id", "")
         if not args.json:
             print(f"[occtl] session {session_id}", file=sys.stderr)
 
     if args.detach:
         with make_client(base, pw) as client:
-            item = unwrap(client.post(f"/api/session/{session_id}/prompt", json={"text": text}))
+            if args.require_idle:
+                ensure_idle(client, session_id)
+            item = post_prompt(client, base, session_id, text)
         if args.json:
             print_json({"sessionID": session_id, "status": "dispatched", "messageID": (item or {}).get("id", "")})
         else:
@@ -506,7 +692,7 @@ def stream_turn(base: str, pw: str, session_id: str, text: str, args: argparse.N
     show_reasoning = getattr(args, "show_reasoning", False)
     deadline = time.monotonic() + timeout if timeout else None
 
-    result: dict[str, Any] = {"sessionID": session_id, "status": "succeeded", "text": ""}
+    result: dict[str, Any] = {"sessionID": session_id, "status": "pending", "text": ""}
     finished = threading.Event()  # 结束时叫停看门狗
     timed_out = threading.Event()
     control = make_client(base, pw)
@@ -528,6 +714,8 @@ def stream_turn(base: str, pw: str, session_id: str, text: str, args: argparse.N
             interrupt_quietly(control, session_id)
 
     client, resp = open_event_stream(base, pw, read_timeout)
+    transport_err: Exception | None = None
+    sent = False
     try:
         gen = iter_events(resp)
         # 1) 等事件流就绪
@@ -536,8 +724,11 @@ def stream_turn(base: str, pw: str, session_id: str, text: str, args: argparse.N
                 break
         # 2) 到点看门狗:即使没有事件也能触发 interrupt,让服务端发事件唤醒主循环
         threading.Thread(target=watchdog, daemon=True).start()
-        # 3) 发消息
-        unwrap(control.post(f"/api/session/{session_id}/prompt", json={"text": text}))
+        # 3) 发消息(可选机器级空闲检查)
+        if getattr(args, "require_idle", False):
+            ensure_idle(control, session_id)
+        post_prompt(control, base, session_id, text)
+        sent = True
         # 4) 读事件直到终态
         try:
             for ev in gen:
@@ -571,21 +762,58 @@ def stream_turn(base: str, pw: str, session_id: str, text: str, args: argparse.N
         except httpx.ReadTimeout:
             interrupt_quietly(control, session_id)
             raise CtlError(f"事件流 {read_timeout}s 无数据,已发送 interrupt", EXIT_TIMEOUT)
+        except httpx.HTTPError as e:  # 连接被掐断/协议错误:走对账
+            transport_err = e
     except KeyboardInterrupt:
         interrupt_quietly(control, session_id)
         print(f"\n[occtl] 已取消;会话 {session_id} 可续用", file=sys.stderr)
         return 130
+    except httpx.ReadTimeout:
+        interrupt_quietly(control, session_id)
+        raise CtlError(f"事件流 {read_timeout}s 无数据,已发送 interrupt", EXIT_TIMEOUT)
+    except httpx.HTTPError as e:
+        transport_err = e
     finally:
         finished.set()
         closed_stream(client, resp)
         control.close()
 
-    # 事件流断开且没有终态
     if timed_out.is_set():
         return report_timeout()
+    if not sent:
+        raise CtlError(f"事件流断开({transport_err or '未就绪'}),消息未发出", EXIT_ERROR)
+
+    # 事件流断开且没有终态:向服务器对账会话真实状态(避免"实际完成但管理端不知道")
+    status = None
+    try:
+        with make_client(base, pw) as rec:
+            status = recover_session(rec, session_id, result)
+    except Exception:
+        status = None
+    if status == "succeeded":
+        result["status"] = "succeeded"
+        if not args.json:
+            print()
+            print(f"[occtl] session={session_id} status=succeeded(事件流断开,已向服务器对账)", file=sys.stderr)
+        if args.json:
+            print_json(result)
+        return EXIT_OK
+    if status in ("failed", "interrupted"):
+        result["status"] = status
+        result.setdefault("error", f"session {status}")
+        if not args.json:
+            print()
+            print(f"[occtl] session={session_id} status={status}(事件流断开,经对账确认)", file=sys.stderr)
+        if args.json:
+            print_json(result)
+        return EXIT_EXEC_FAILED
+    if status == "running":
+        raise CtlError(f"事件流断开但会话仍在执行;用 wait / messages 跟踪 {session_id}", EXIT_ERROR)
+    result["status"] = "unknown"
     if args.json:
         print_json(result)
-    raise CtlError("事件流意外结束(未收到终态事件)", EXIT_ERROR)
+    detail = f":{transport_err}" if transport_err else ""
+    raise CtlError(f"事件流意外结束{detail},且无法对账会话状态", EXIT_ERROR)
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +891,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("session_id")
     p.add_argument("text", nargs="+")
     p.add_argument("--wait", action="store_true", help="流式输出并等待终态")
+    p.add_argument("--require-idle", action="store_true", help="目标机有其它会话在跑时拒绝派发")
     p.add_argument("--timeout", type=float, help="整体超时秒数")
     p.add_argument("--read-timeout", type=float, default=DEFAULT_READ_TIMEOUT)
     p.add_argument("--show-reasoning", action="store_true")
@@ -673,6 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", help="新建会话时的项目目录")
     p.add_argument("--session", help="续用已有会话;给了就不再新建")
     p.add_argument("--detach", action="store_true", help="派发后立即返回(不等执行;用 ps/messages/wait 跟踪)")
+    p.add_argument("--require-idle", action="store_true", help="目标机有其它会话在跑时拒绝派发")
     p.add_argument("--title")
     p.add_argument("--agent")
     p.add_argument("--model", help="provider/model[#variant]")
