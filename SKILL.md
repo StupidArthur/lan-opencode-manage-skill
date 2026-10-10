@@ -54,11 +54,11 @@ python3.11 scripts/occtl.py --server pc-01 info
 
 ```sh
 # 1) 新建并跑(输出:会话 id 在 stderr,正文流式打到 stdout)
-python3.11 scripts/occtl.py --server pc-01 --json run --dir D:/work/project-a "把 render/config.yaml 调到 4K/30fps"
+python3.11 scripts/occtl.py --server pc-01 --json run --dir D:/work/project-a "核对 origin,使用任务分支 agent/20261009-01,把 render/config.yaml 调到 4K/30fps"
 # => {"sessionID":"ses_xxx","status":"succeeded","text":"..."}
 
 # 2) 用上一步的 sessionID 续一轮(上下文保留)
-python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "把改动提交到本人分支"
+python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "运行测试,提交并推送任务分支;返回分支、Commit SHA 和测试结果"
 
 # 3) 会话不删会一直留在该 PC 的 opencode 里,可随时 ls 找到、get 查看、rm 删除
 ```
@@ -78,14 +78,25 @@ python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "把改�
 ### 数据结构
 
 - `servers.json`(本仓库根目录或 `~/.config/occtl/servers.json`):机器名 → url/password。**唯一机器清单**。
-- 任务台账(建议在管理机维护,例如 `fleet-ledger.jsonl`),每行一条:
+- 当前项目任务台账(建议放在管理侧该项目的 `.ocmanage/tasks.jsonl`,加入 `.gitignore` 避免提交),每行一条:
 
   ```json
-  {"jobId":"20261009-01","pc":"pc-01","sessionID":"ses_x","dir":"D:/work/project-a","prompt":"...","state":"dispatched","createdAt":1791549000000,"endedAt":null,"summary":null}
+  {"jobId":"20261009-01","pc":"pc-01","sessionID":"ses_x","dir":"D:/work/project-a","baseSha":"<sha>","branch":"agent/20261009-01","commit":null,"prompt":"...","state":"dispatched","createdAt":1791549000000,"endedAt":null,"summary":null}
   ```
 
   state 取值:`dispatched`(已派)→ `running`(ps/messages 看到在跑)→ `done`/`failed`(终态)→ `accepted`/`rejected`(验收)。
   终态依据:会话 `outcome`(succeeded/failed/interrupted)+ 最新 assistant 文本摘要。
+
+### Git 多机协作(一个目录一个项目)
+
+- **管理侧一个工作目录只对应一个项目、一个 Git 仓库**。先在项目目录用 `git rev-parse --show-toplevel` 和 `git remote get-url origin` 确认仓库;不在单目录混合管理多个项目,不维护全局项目注册表。
+- 全局 `servers.json` 只记录机器。项目和 PC 可动态组合;每次派活明确 PC、目标机目录、仓库 origin、基准分支/Commit SHA、任务分支。
+- 远端 Agent 自行 `git clone`(首次)或 `git fetch`(已有);若尚未 clone,先在目标 PC **已存在的父目录**启动初始化会话,clone 后再将 `--dir` 指向仓库。已有目录必须核对 origin,不匹配即停止。
+- 派活前先检查远端 `git status`,不得覆盖未提交或未跟踪改动,禁止未经确认的 `reset --hard` / `clean -fd`。
+- 每个任务基于指定基准创建独立分支,如 `agent/<jobId>`;不同 PC 可以并行,不可共同直接修改主分支或共用任务分支。
+- 远端完成开发与测试后,自行 `commit + push` 到**任务分支**,返回任务 ID、PC、Session ID、分支名、Commit SHA、测试摘要和风险;不得直接合并主分支。
+- Manager 从当前项目仓库 fetch 任务分支或检查 PR,以基准提交核对 diff 并验收;通过后由 Manager 协调合并,否则标记 `rejected` 并安排修复。
+- **分工**:Git 负责代码共享,Session 负责任务上下文,Manager 负责调度/验收;本地运行态台账不纳入 Git。大型二进制文件酌情用 Git LFS/独立存储。
 
 ### 派活(不阻塞)
 
@@ -93,10 +104,10 @@ python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "把改�
 python3.11 scripts/occtl.py ps                                   # 1) 先看哪台空闲
 python3.11 scripts/occtl.py --server pc-01 --json run --detach \
     --require-idle --dir D:/work/project-a "任务文本"             # 2) 派发,拿 sessionID
-# 3) 立刻把 {jobId, pc, sessionID, dir, prompt} 写进台账
+# 3) 立刻把 {jobId, pc, sessionID, dir, baseSha, branch, prompt} 写入当前项目台账
 ```
 
-`--require-idle` 是程序级防呆:派发前先查目标机 `/api/session/active`,有其它会话在跑就直接拒绝(exit 1),比"靠自觉"硬一层。
+`--require-idle` 是程序级防呆:派发前先查目标机 `/api/session/active`,有其它会话在跑就直接拒绝(exit 1);这是尽力检查,不是跨管理机的原子锁。
 
 ### 盯梢
 
@@ -111,9 +122,9 @@ python3.11 scripts/occtl.py --server pc-01 run --session ses_x "..."  # 需要�
 
 ### 验收与收尾(逐任务)
 
-1. 终态为 succeeded 后,在**同一目录**开验收会话:`run --dir <同目录> "git status 和 git diff,把变更摘要和风险点列出来"`(目标机有自己的 git 身份,不要替它管理账号);
-2. 人工/agent 判断通过 → 让它 `commit + push` 到本人分支;不通过 → 台账记 `rejected` 并决定重试或放弃;
-3. 会话**不删**,便于追问;确认无用后 `rm`,并把台账行更新到底。
+1. 确认任务终态,让远端 Agent 在任务分支运行测试、`commit + push`,返回分支、Commit SHA、测试结果和风险;每台 PC 使用自己的 Git 身份。
+2. Manager 在当前项目目录 `git fetch` 任务分支或查看 PR,依据基准 SHA 审查 diff/测试;验收通过后由 Manager 合并,不通过则台账记 `rejected`,让远端继续修复;未经验收不得合并主分支。
+3. 将分支、Commit SHA 和验收结果更新到当前项目台账;会话不删便于追问,确认无用后再 `rm`。
 
 ### 并发纪律(重要)
 
