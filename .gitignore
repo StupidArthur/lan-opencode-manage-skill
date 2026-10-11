@@ -1,4 +1,14 @@
 __pycache__/
 *.pyc
 .venv/
+
+# 机器清单:含真实 IP/密码,绝不入库
 occtl-servers.json
+servers.json
+*.servers.json
+
+# 本地运行态台账(含 PC 名、任务内容)
+.ocmanage/
+
+# 备份/临时
+*.bak
