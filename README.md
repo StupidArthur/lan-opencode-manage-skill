@@ -4,7 +4,7 @@
 
 - `SKILL.md` —— 可被 opencode 自动发现的 skill:教 agent 把整个机队当资源池来调度(派活 / 盯梢 / 验收 / 并发纪律)。
 - `scripts/occtl.py` —— Python 3.11 + httpx 单文件 CLI,封装 opencode HTTP API:会话管理、prompt、SSE 事件流、断流对账。
-- `scripts/test_occtl.py` —— 18 个单元用例,内建假 opencode 服务器(含 SSE),无需真实环境。
+- `scripts/test_occtl.py` —— 20 个单元用例,内建假 opencode 服务器(含 SSE),无需真实环境。
 - `scripts/test_integration.py` —— 真实服务器集成测试(环境变量开关,默认跳过)。
 
 ## 目标机准备(每台 PC,一次)
@@ -51,16 +51,26 @@ cp references/servers.example.json occtl-servers.json
 python3.11 scripts/occtl.py ps
 
 # 派活(不阻塞,拿 sessionID;--require-idle 让程序拒绝在有任务执行的机器上再派)
-python3.11 scripts/occtl.py --server pc-01 --json run --detach --require-idle \
-    --dir D:/work/project-a "任务…"
+python3.11 scripts/occtl.py --server PC88 --json run --detach --require-idle \
+    --dir D:/work/project-a "只在 PC88 分支开发并 push,不得合并主分支;任务…"
 
 # 流式跑完(等终态)
-python3.11 scripts/occtl.py --server pc-01 run --dir D:/work/project-a "任务…"
+python3.11 scripts/occtl.py --server PC88 run --dir D:/work/project-a "任务…"
 ```
 
 命令:`info / servers / ps / ls / new / get / rm / messages / run(--detach --require-idle) / prompt(--wait) / wait / interrupt / events`,全部支持 `--json`。
 
 退出码:`0` 成功 · `1` 用法/HTTP 错误 · `2` 会话执行失败 · `3` 超时(已自动 interrupt,会话可续用)。
+
+## 多机 Git 协作规则
+
+- **管理侧一个目录只对应一个项目/一个 Git 仓库**,通过当前目录的 `origin` 识别项目;不维护全局项目注册表。
+- **机器名即长期分支名**:例如服务器 `192.168.1.88` 命名为 `PC88`,`192.168.1.89` 命名为 `PC89`。在每个项目仓库,PC88 只在 `PC88` 分支提交与推送,PC89 只在 `PC89` 分支提交与推送;不按任务创建新分支。
+- **主控独占合并与派工决定权**:各 PC 自行 clone/fetch、开发测试、`commit + push` 自己的分支,但不能写主分支或其他 PC 的分支、不能自行合并或领取下一任务。
+- **每轮任务必须过闸**:主控审查机器分支的 diff/测试,选择合并、退回修复或放弃;已合并的分支先安全同步主分支,才给该 PC 派下一任务。多 PC 可以并行,单 PC 不会自行连续接任务。
+- **分支历史**:长期固定 PC 分支默认使用保留祖先关系的 merge commit/fast-forward 合并,便于之后 `git merge --ff-only origin/<主分支>` 同步;遇到非快进、未提交修改时停止并请主控处理。建议在 Git 服务端保护主分支并配置机器级推送权限,文档约束本身不能防止越权推送。
+
+详细执行步骤见 [SKILL.md](SKILL.md#git-多机协作固定-pc-分支主控审批)。
 
 ## 版本兼容
 
