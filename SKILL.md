@@ -30,7 +30,7 @@ python3.11 -m pip install httpx        # 首次
 python3.11 scripts/occtl.py --server http://192.168.1.11:4096 --password "$PW" info
 
 # 多台机器:复制 references/servers.example.json 为 occtl-servers.json(或 ~/.config/occtl/servers.json)
-python3.11 scripts/occtl.py --server pc-01 info
+python3.11 scripts/occtl.py --server PC88 info
 ```
 
 常用命令(全部支持 `--json`):
@@ -54,11 +54,11 @@ python3.11 scripts/occtl.py --server pc-01 info
 
 ```sh
 # 1) 新建并跑(输出:会话 id 在 stderr,正文流式打到 stdout)
-python3.11 scripts/occtl.py --server pc-01 --json run --dir D:/work/project-a "核对 origin,使用任务分支 agent/20261009-01,把 render/config.yaml 调到 4K/30fps"
+python3.11 scripts/occtl.py --server PC88 --json run --dir D:/work/project-a "确认仓库 origin 与基准 SHA,只在本机固定分支 PC88 上修改 render/config.yaml 到 4K/30fps"
 # => {"sessionID":"ses_xxx","status":"succeeded","text":"..."}
 
 # 2) 用上一步的 sessionID 续一轮(上下文保留)
-python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "运行测试,提交并推送任务分支;返回分支、Commit SHA 和测试结果"
+python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行测试,只提交并推送 PC88 分支;返回 Commit SHA 与测试结果;等待主控验收"
 
 # 3) 会话不删会一直留在该 PC 的 opencode 里,可随时 ls 找到、get 查看、rm 删除
 ```
@@ -77,33 +77,34 @@ python3.11 scripts/occtl.py --server pc-01 --json run --session ses_xxx "运行�
 
 ### 数据结构
 
-- `servers.json`(本仓库根目录或 `~/.config/occtl/servers.json`):机器名 → url/password。**唯一机器清单**。
+- `servers.json`(本仓库根目录或 `~/.config/occtl/servers.json`):机器名 → url/password。**唯一机器清单**,机器名采用 `PC` + IPv4 末段(如 `PC88` → `192.168.1.88`);大小写固定,即该机器在每个项目仓库的分支名。
 - 当前项目任务台账(建议放在管理侧该项目的 `.ocmanage/tasks.jsonl`,加入 `.gitignore` 避免提交),每行一条:
 
   ```json
-  {"jobId":"20261009-01","pc":"pc-01","sessionID":"ses_x","dir":"D:/work/project-a","baseSha":"<sha>","branch":"agent/20261009-01","commit":null,"prompt":"...","state":"dispatched","createdAt":1791549000000,"endedAt":null,"summary":null}
+  {"jobId":"20261009-01","pc":"PC88","sessionID":"ses_x","dir":"D:/work/project-a","baseSha":"<sha>","branch":"PC88","commit":null,"prompt":"...","state":"dispatched","createdAt":1791549000000,"endedAt":null,"summary":null}
   ```
 
-  state 取值:`dispatched`(已派)→ `running`(ps/messages 看到在跑)→ `done`/`failed`(终态)→ `accepted`/`rejected`(验收)。
+  state 取值:`dispatched`(已派)→ `running`(执行中)→ `done`/`failed`(执行终态)→ `accepted`/`rejected`(主控验收)→ `merged`(已合并);被拒任务在同一机器分支继续修正,不直接启动下一任务。
   终态依据:会话 `outcome`(succeeded/failed/interrupted)+ 最新 assistant 文本摘要。
 
-### Git 多机协作(一个目录一个项目)
+### Git 多机协作(固定 PC 分支,主控审批)
 
-- **管理侧一个工作目录只对应一个项目、一个 Git 仓库**。先在项目目录用 `git rev-parse --show-toplevel` 和 `git remote get-url origin` 确认仓库;不在单目录混合管理多个项目,不维护全局项目注册表。
-- 全局 `servers.json` 只记录机器。项目和 PC 可动态组合;每次派活明确 PC、目标机目录、仓库 origin、基准分支/Commit SHA、任务分支。
-- 远端 Agent 自行 `git clone`(首次)或 `git fetch`(已有);若尚未 clone,先在目标 PC **已存在的父目录**启动初始化会话,clone 后再将 `--dir` 指向仓库。已有目录必须核对 origin,不匹配即停止。
-- 派活前先检查远端 `git status`,不得覆盖未提交或未跟踪改动,禁止未经确认的 `reset --hard` / `clean -fd`。
-- 每个任务基于指定基准创建独立分支,如 `agent/<jobId>`;不同 PC 可以并行,不可共同直接修改主分支或共用任务分支。
-- 远端完成开发与测试后,自行 `commit + push` 到**任务分支**,返回任务 ID、PC、Session ID、分支名、Commit SHA、测试摘要和风险;不得直接合并主分支。
-- Manager 从当前项目仓库 fetch 任务分支或检查 PR,以基准提交核对 diff 并验收;通过后由 Manager 协调合并,否则标记 `rejected` 并安排修复。
-- **分工**:Git 负责代码共享,Session 负责任务上下文,Manager 负责调度/验收;本地运行态台账不纳入 Git。大型二进制文件酌情用 Git LFS/独立存储。
+1. **项目边界**:管理侧一个工作目录只对应一个项目、一个 Git 仓库;用 `git rev-parse --show-toplevel`、`git remote get-url origin` 确认,不建全局项目注册表。远端同一项目的目录可不同,但 `origin` 必须一致。
+2. **机器命名**:全局 `servers.json` 中的名称是机器身份,约定 `192.168.1.88 → PC88`、`192.168.1.89 → PC89`。机器名**区分大小写**且在注册表中唯一;地址变化须先核对并更新映射,不可按未知 IP 猜测机器身份。
+3. **固定分支**:在**每个项目仓库**里,非主控 `PC88` 只允许在 `PC88` 分支开发、`commit` 和 `push origin PC88`; `PC89` 同理。机器分支长期复用,**不按任务另建 `agent/<jobId>` 分支**。非主控不得向主分支或他机分支提交/推送,不得执行合并或强推;主控独占主分支合并决定权。
+4. **远端初始化**:首次由该 PC 的 Agent 在已存在的父目录内 `git clone`,之后改用仓库目录作为 `--dir`;已有仓库先 `git fetch origin`、核对 remote 和 `git status`。不覆盖未提交修改,未经确认不得 `reset --hard`、`clean -fd`。
+5. **派活准备**:主控明确 PC、项目、远端目录、基准分支(如 `main`)、基准 Commit SHA 和任务 ID。首次从 `origin/main` 建立同名机器分支;后续仅在**上轮已验收并合并、工作区干净**时同步主分支到该分支。若无法快进或仍有未合并工作,停下并报告主控。
+6. **交付**:非主控只在自己的机器分支修改并测试,完成后 `commit + push` 该分支,向主控返回任务 ID、Session ID、分支名、Commit SHA、测试结果和风险;不得自己合并或自行领取下一任务。
+7. **主控闸门**:主控 `git fetch` 相应机器分支或查看 PR,核对相对基准的 diff 与测试;决定 `merge`、退回继续修改或放弃。**主控明确处理本轮结果之前,不可向该 PC 派下一任务**;不同 PC 的独立任务可并行。
+8. **合并后同步**:默认由主控以**保留原提交祖先关系**的 merge commit / fast-forward 合并到主分支(不默认 squash/rebase 长期机器分支)。主控确认合并后,PC 在干净的本机分支上 `git fetch origin` → `git merge --ff-only origin/main` → `git push origin <PC名>`,成功后才接新任务;快进失败需主控介入,不能擅自重置或强推。
+9. **分工与权限**:Git 共享代码,Session 执行任务,主控管派发与验收;本地运行态台账不入 Git。Skill 是行为约束,如需**技术上禁止越权 push**应在 Git 服务器保护主分支并为不同机器配置独立凭据/推送权限。
 
 ### 派活(不阻塞)
 
 ```sh
 python3.11 scripts/occtl.py ps                                   # 1) 先看哪台空闲
-python3.11 scripts/occtl.py --server pc-01 --json run --detach \
-    --require-idle --dir D:/work/project-a "任务文本"             # 2) 派发,拿 sessionID
+python3.11 scripts/occtl.py --server PC88 --json run --detach \
+    --require-idle --dir D:/work/project-a "仅在 PC88 分支工作;完成后 push PC88,不得合并" # 2) 派发
 # 3) 立刻把 {jobId, pc, sessionID, dir, baseSha, branch, prompt} 写入当前项目台账
 ```
 
@@ -113,23 +114,23 @@ python3.11 scripts/occtl.py --server pc-01 --json run --detach \
 
 ```sh
 python3.11 scripts/occtl.py ps                                   # 全队:谁在跑
-python3.11 scripts/occtl.py --server pc-01 --json messages ses_x --limit 5
+python3.11 scripts/occtl.py --server PC88 --json messages ses_x --limit 5
 # → 看 newest assistant 文本与 idle.outcome 判断 done/failed
-python3.11 scripts/occtl.py --server pc-01 run --session ses_x "..."  # 需要时续轮
+python3.11 scripts/occtl.py --server PC88 run --session ses_x "..."  # 需要时续轮
 ```
 
 `run/prompt --wait` 的事件流被掐断时,occtl 会**自动向服务器对账**:查会话 `outcome`(succeeded/failed/interrupted)并补回最终文本;若仍在跑会明确提示用 `wait`/`messages` 跟踪。不需要重跑任务。
 
 ### 验收与收尾(逐任务)
 
-1. 确认任务终态,让远端 Agent 在任务分支运行测试、`commit + push`,返回分支、Commit SHA、测试结果和风险;每台 PC 使用自己的 Git 身份。
-2. Manager 在当前项目目录 `git fetch` 任务分支或查看 PR,依据基准 SHA 审查 diff/测试;验收通过后由 Manager 合并,不通过则台账记 `rejected`,让远端继续修复;未经验收不得合并主分支。
-3. 将分支、Commit SHA 和验收结果更新到当前项目台账;会话不删便于追问,确认无用后再 `rm`。
+1. 确认任务终态,让远端只在**与机器同名的分支**(如 `PC88`)完成测试、`commit + push`,返回 Commit SHA、测试与风险;远端不得合并或自主领取新任务。
+2. 主控在当前项目目录 `git fetch origin PC88`,按基准 SHA 审核 diff/测试:通过则仅由主控合并主分支;不通过则退回同一 PC 分支修复或明确放弃。主控处理完本轮任务后才能决定是否派下一任务。
+3. 合并后让对应 PC 安全快进同步主分支,确认成功再派下一任务;写回机器分支、Commit SHA、`accepted/rejected/merged` 结果到项目台账。保留 Session 便于追问,不用后再 `rm`。
 
 ### 并发纪律(重要)
 
 - **每台 PC 同时最多 1 个干活任务**:web 模式没有队列,靠这条纪律约束;派活先 `ps` 看目标机 `running` 数,并给 `run --detach` 加 `--require-idle`(程序会拒绝在有任务执行时派发);
-- 不同 PC 可并行;同一 PC 的第二个任务等前一个终态后再派;
+- 不同 PC 可并行;同一 PC 的第二个任务不仅要等前一个执行终态,还要等主控完成验收/合并决定以及固定机器分支同步,不可仅凭 `ps` 空闲就派发;
 - 派发成功的第一步就是写台账——sessionID 丢了就等于任务丢了。
 
 ## 安全
