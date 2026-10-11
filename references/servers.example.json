@@ -2,11 +2,13 @@
   "servers": {
     "PC88": {
       "url": "http://192.168.1.88:4096",
-      "password": "change-me-88"
+      "password": "change-me-88",
+      "model": "opencode-go/deepseek-v4.1-flash"
     },
     "PC89": {
       "url": "http://192.168.1.89:4096",
-      "password": "change-me-89"
+      "password": "change-me-89",
+      "model": "opencode-go/glm-5.3-flash"
     }
   }
 }

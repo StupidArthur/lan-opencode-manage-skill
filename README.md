@@ -46,7 +46,7 @@ python3.11 -m pip install httpx
 # 单机
 python3.11 scripts/occtl.py --server http://192.168.1.11:4096 --password "$PW" ps
 
-# 多机:复制 references/servers.example.json 为 occtl-servers.json 并填 url/密码
+# 多机:复制 references/servers.example.json 为 occtl-servers.json 并填 url/密码/模型
 cp references/servers.example.json occtl-servers.json
 python3.11 scripts/occtl.py ps
 
@@ -61,6 +61,23 @@ python3.11 scripts/occtl.py --server PC88 run --dir D:/work/project-a "任务…
 命令:`info / servers / ps / ls / new / get / rm / messages / run(--detach --require-idle) / prompt(--wait) / wait / interrupt / events`,全部支持 `--json`。
 
 退出码:`0` 成功 · `1` 用法/HTTP 错误 · `2` 会话执行失败 · `3` 超时(已自动 interrupt,会话可续用)。
+
+## 每台机器绑定模型
+
+`occtl-servers.json` 里每台机器可以带一个 `model` 字段,派活时自动生效——**不必在命令行写 `--model`**:
+
+```json
+{
+  "servers": {
+    "PC88": { "url": "http://192.168.1.88:4096", "password": "…", "model": "opencode-go/deepseek-v4.1-flash" },
+    "PC89": { "url": "http://192.168.1.89:4096", "password": "…", "model": "opencode-go/glm-5.3-flash" }
+  }
+}
+```
+
+取值优先级:`--model` > 环境变量 `OCCTL_MODEL` > 该机 `model` > 目标机 opencode 默认模型(`GET /api/model/default`)。
+
+> 为什么要有这个:token plan 可能只有 1~2 个,但要管 N 台 PC。把模型绑在机器上,不同 PC 用不同模型(乃至不同 plan),才能把额度摊开;反过来,如果谁都靠目标机默认,你就会拿到一个自己没挑过的模型。`servers --probe` 和 `ps` 都会把绑定的模型打印出来。
 
 ## 多机 Git 协作规则
 

@@ -38,7 +38,7 @@ python3.11 scripts/occtl.py --server PC88 info
 | 命令 | 说明 |
 |------|------|
 | `info` | 探活/服务信息 |
-| `servers [--probe]` | 列出 servers.json 里的机器 |
+| `servers [--probe]` | 列出 servers.json 里的机器(含各自绑定的模型) |
 | `ps` | **全队视图**:每台在线状态 + 正在跑的会话(管理入口) |
 | `ls [--dir D:/w] [--limit N]` | 会话列表(含 outcome) |
 | `run --dir D:/w "任务"` | **新建会话**跑任务,流式输出,等结束 |
@@ -77,7 +77,8 @@ python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行�
 
 ### 数据结构
 
-- `servers.json`(本仓库根目录或 `~/.config/occtl/servers.json`):机器名 → url/password。**唯一机器清单**,机器名采用 `PC` + IPv4 末段(如 `PC88` → `192.168.1.88`);大小写固定,即该机器在每个项目仓库的分支名。
+- `servers.json`(本仓库根目录或 `~/.config/occtl/servers.json`):机器名 → `url` / `password` / **`model`**。**唯一机器清单**,机器名采用 `PC` + IPv4 末段(如 `PC88` → `192.168.1.88`);大小写固定,即该机器在每个项目仓库的分支名。
+- **`model` 是每台机器的绑定模型**(如 `opencode-go/deepseek-v4.1-flash`)。机队里各机用不同模型,是为了把有限的 token plan 摊到 N 台机器上。`occtl` 新建会话时按 `--model` > `OCCTL_MODEL` > 该机 `model` 的顺序取值;**三者都没有才会落到目标机 opencode 的默认模型**(用 `GET /api/model/default` 查),那个默认值与你派活的意图无关,不要依赖它。
 - 当前项目任务台账(建议放在管理侧该项目的 `.ocmanage/tasks.jsonl`,加入 `.gitignore` 避免提交),每行一条:
 
   ```json
@@ -105,6 +106,7 @@ python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行�
 python3.11 scripts/occtl.py ps                                   # 1) 先看哪台空闲
 python3.11 scripts/occtl.py --server PC88 --json run --detach \
     --require-idle --dir D:/work/project-a "仅在 PC88 分支工作;完成后 push PC88,不得合并" # 2) 派发
+# 模型不用在命令行写:--server PC88 会自动带上 servers.json 里给 PC88 绑定的 model
 # 3) 立刻把 {jobId, pc, sessionID, dir, baseSha, branch, prompt} 写入当前项目台账
 ```
 
