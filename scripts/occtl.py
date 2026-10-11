@@ -101,10 +101,12 @@ def resolve_server(args: argparse.Namespace) -> tuple[str, str]:
     if not ref:
         raise CtlError("缺少 --server(URL 或 servers.json 里的名字),或用 OCCTL_SERVER 环境变量")
 
-    password = args.password or os.environ.get("OCCTL_PASSWORD") or os.environ.get("OPENCODE_PASSWORD") or ""
+    # 客户端显式密码优先;OpenCode 服务端变量仅用作兜底,不会覆盖机器清单的独立密码。
+    password = args.password or os.environ.get("OCCTL_PASSWORD") or ""
+    fallback = os.environ.get("OPENCODE_SERVER_PASSWORD") or os.environ.get("OPENCODE_PASSWORD") or ""
 
     if ref.startswith("http://") or ref.startswith("https://"):
-        return ref.rstrip("/"), password
+        return ref.rstrip("/"), password or fallback
 
     entry = load_registry(Path(args.servers).expanduser() if args.servers else default_servers_path()).get(ref)
     if entry is None:
@@ -113,7 +115,7 @@ def resolve_server(args: argparse.Namespace) -> tuple[str, str]:
     if not url:
         raise CtlError(f"服务器 {ref!r} 缺少 url 字段")
     if not password:
-        password = str(entry.get("password", ""))
+        password = str(entry.get("password", "")) or fallback
     return url, password
 
 
@@ -481,7 +483,7 @@ def cmd_servers(args: argparse.Namespace) -> int:
         print(f"# {path or '(未找到 servers.json)'}")
         for row in rows:
             mark = {True: "online", False: "OFFLINE", None: "-"}[row["online"]]
-            print(f"{row['name']:<12} {mark:<8} {row['url']}  {row['model'] or '(目标机默认)'}")
+            print(f"{row['name']:<12} {mark:<8} {row['url']}  configured_model:{row['model'] or '(目标机默认)'}")
     return EXIT_OK
 
 
@@ -521,11 +523,11 @@ def cmd_ps(args: argparse.Namespace) -> int:
         return EXIT_OK
     for row in rows:
         if not row["online"]:
-            print(f"{row['name']:<12} OFFLINE   {row['url']}   model:{row['model'] or '(目标机默认)'}")
+            print(f"{row['name']:<12} OFFLINE   {row['url']}   configured_model:{row['model'] or '(目标机默认)'}")
             continue
         act = row["active"]
         detail = "  ".join(act.keys()) if act else "-"
-        print(f"{row['name']:<12} online   running:{len(act):<3} {detail}   model:{row['model'] or '(目标机默认)'}")
+        print(f"{row['name']:<12} online   running:{len(act):<3} {detail}   configured_model:{row['model'] or '(目标机默认)'}")
     return EXIT_OK
 
 
@@ -883,7 +885,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="控制局域网内已开启 web 模式(opencode serve)的 opencode",
     )
     parser.add_argument("--server", help="http(s)://host:port 或 servers.json 里的名字(env: OCCTL_SERVER)")
-    parser.add_argument("--password", help="访问密码(env: OCCTL_PASSWORD / OPENCODE_PASSWORD)")
+    parser.add_argument("--password", help="访问密码(env: OCCTL_PASSWORD;直连时亦可用 OPENCODE_SERVER_PASSWORD)")
     parser.add_argument("--servers", help="servers.json 路径(env: OCCTL_SERVERS)")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出(便于脚本/agent 消费)")
     parser.add_argument("--version", action="version", version=f"occtl {VERSION}")
