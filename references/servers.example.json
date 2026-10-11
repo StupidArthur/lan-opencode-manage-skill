@@ -1,12 +1,12 @@
 {
   "servers": {
-    "pc-01": {
-      "url": "http://192.168.1.11:4096",
-      "password": "change-me-01"
+    "PC88": {
+      "url": "http://192.168.1.88:4096",
+      "password": "change-me-88"
     },
-    "pc-02": {
-      "url": "http://192.168.1.12:4096",
-      "password": "change-me-02"
+    "PC89": {
+      "url": "http://192.168.1.89:4096",
+      "password": "change-me-89"
     }
   }
 }
