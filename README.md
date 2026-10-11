@@ -26,7 +26,7 @@ set "OPENCODE_SERVER_PASSWORD=replace-with-strong-password" && opencode serve --
 - `OPENCODE_SERVER_PASSWORD` 是 OpenCode V2 的**正确认证变量名**;旧文档里的 `OPENCODE_PASSWORD` 不是服务端认证变量。未设置服务端密码不应被视为安全。
 - CMD 的 `set` 只影响当前命令提示符及其子进程,**不会写入用户级或系统级持久环境变量**。关闭 CMD 即失效;停止服务后也可运行 `set "OPENCODE_SERVER_PASSWORD="` 清除当前窗口中的值。
 - `opencode web` 提供浏览器界面和 API; `opencode serve` 提供无界面 API。两者均可被本工具管理。
-- 用 `--hostname 0.0.0.0` 允许局域网连接;端口为 `4096`。仅限可信 LAN,不要将端口映射公网。含 `%\` 等 CMD 特殊字符的密码需要按 CMD 规则正确转义。
+- 用 `--hostname 0.0.0.0` 允许局域网连接;端口为 `4096`。仅限可信 LAN,不要将端口映射公网。若密码含 CMD 特殊字符(例如百分号、感叹号),需按 CMD 的命令行规则正确转义。
 
 首次需要放行 Windows 防火墙(以管理员身份运行 CMD,限制为本地子网):
 
@@ -57,19 +57,19 @@ py -3.11 -m pip install httpx
 
 ```bat
 :: 单机直连:可用 --password 传入,或在当前 CMD 中设置 OCCTL_PASSWORD
-py -3.11 scripts\\occtl.py --server http://192.168.1.11:4096 --password "your-password" info
+py -3.11 scripts\occtl.py --server http://192.168.1.11:4096 --password "your-password" info
 
 :: 多机:复制示例(只需操作一次),填好每台机器的 url / password / model
-copy references\\servers.example.json occtl-servers.json
+copy references\servers.example.json occtl-servers.json
 
 :: 查看机队
-py -3.11 scripts\\occtl.py ps
+py -3.11 scripts\occtl.py ps
 
 :: 派活(不阻塞,返回 sessionID)
-py -3.11 scripts\\occtl.py --server PC88 --json run --detach --require-idle --dir D:/work/project-a "只在 PC88 分支开发并 push,不得合并主分支"
+py -3.11 scripts\occtl.py --server PC88 --json run --detach --require-idle --dir D:/work/project-a "只在 PC88 分支开发并 push,不得合并主分支"
 
 :: 流式跑完(等终态)
-py -3.11 scripts\\occtl.py --server PC88 run --dir D:/work/project-a "任务描述"
+py -3.11 scripts\occtl.py --server PC88 run --dir D:/work/project-a "任务描述"
 ```
 
 `occtl-servers.json` 是**主控侧**的机器地址及密码清单;与**工作机启动时**临时设置的 `OPENCODE_SERVER_PASSWORD` 应逐台对应。该文件含明文密码,禁止提交或分享。通过机器名访问时,客户端优先使用清单中该机器的密码,不会被主控 CMD 中同名的服务端密码覆盖。
