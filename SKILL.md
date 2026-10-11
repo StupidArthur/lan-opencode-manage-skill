@@ -63,15 +63,15 @@ py -3.11 scripts\occtl.py --server PC88 info
 
 ### 跑任务的典型流程
 
-```sh
-# 1) 新建并跑(输出:会话 id 在 stderr,正文流式打到 stdout)
-python3.11 scripts/occtl.py --server PC88 --json run --dir D:/work/project-a "确认仓库 origin 与基准 SHA,只在本机固定分支 PC88 上修改 render/config.yaml 到 4K/30fps"
-# => {"sessionID":"ses_xxx","status":"succeeded","text":"..."}
+```bat
+:: 1) 新建并跑(输出:会话 id 在 stderr,正文流式打到 stdout)
+py -3.11 scripts\occtl.py --server PC88 --json run --dir D:/work/project-a "确认仓库 origin 与基准 SHA,只在本机固定分支 PC88 上修改 render/config.yaml 到 4K/30fps"
+:: => {"sessionID":"ses_xxx","status":"succeeded","text":"..."}
 
-# 2) 用上一步的 sessionID 续一轮(上下文保留)
-python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行测试,只提交并推送 PC88 分支;返回 Commit SHA 与测试结果;等待主控验收"
+:: 2) 用上一步的 sessionID 续一轮(上下文保留)
+py -3.11 scripts\occtl.py --server PC88 --json run --session ses_xxx "运行测试,只提交并推送 PC88 分支;返回 Commit SHA 与测试结果;等待主控验收"
 
-# 3) 会话不删会一直留在该 PC 的 opencode 里,可随时 ls 找到、get 查看、rm 删除
+:: 3) 会话不删会一直留在该 PC 的 opencode 里,可随时 ls 找到、get 查看、rm 删除
 ```
 
 - `--dir` 必须是**目标 PC 上的路径**(如 `D:/work/project-a`),不要用本机路径。
@@ -113,23 +113,26 @@ python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行�
 
 ### 派活(不阻塞)
 
-```sh
-python3.11 scripts/occtl.py ps                                   # 1) 先看哪台空闲
-python3.11 scripts/occtl.py --server PC88 --json run --detach \
-    --require-idle --dir D:/work/project-a "仅在 PC88 分支工作;完成后 push PC88,不得合并" # 2) 派发
-# 模型不用在命令行写:--server PC88 创建新 session 时自动使用机器清单绑定的 model;续用旧 session 不重选模型
-# 3) 立刻把 {jobId, pc, sessionID, dir, baseSha, branch, prompt} 写入当前项目台账
+```bat
+:: 1) 先看哪台空闲
+py -3.11 scripts\occtl.py ps
+:: 2) 派发
+py -3.11 scripts\occtl.py --server PC88 --json run --detach --require-idle --dir D:/work/project-a "仅在 PC88 分支工作;完成后 push PC88,不得合并"
+:: 模型不用在命令行写:--server PC88 创建新 session 时自动使用机器清单绑定的 model;续用旧 session 不重选模型
+:: 3) 立刻把 {jobId, pc, sessionID, dir, baseSha, branch, prompt} 写入当前项目台账
 ```
 
 `--require-idle` 是程序级防呆:派发前先查目标机 `/api/session/active`,有其它会话在跑就直接拒绝(exit 1);这是尽力检查,不是跨管理机的原子锁。
 
 ### 盯梢
 
-```sh
-python3.11 scripts/occtl.py ps                                   # 全队:谁在跑
-python3.11 scripts/occtl.py --server PC88 --json messages ses_x --limit 5
-# → 看 newest assistant 文本与 idle.outcome 判断 done/failed
-python3.11 scripts/occtl.py --server PC88 run --session ses_x "..."  # 需要时续轮
+```bat
+:: 全队:谁在跑
+py -3.11 scripts\occtl.py ps
+py -3.11 scripts\occtl.py --server PC88 --json messages ses_x --limit 5
+:: → 看 newest assistant 文本与 idle.outcome 判断 done/failed
+:: 需要时续轮
+py -3.11 scripts\occtl.py --server PC88 run --session ses_x "..."
 ```
 
 `run/prompt --wait` 的事件流被掐断时,occtl 会**自动向服务器对账**:查会话 `outcome`(succeeded/failed/interrupted)并补回最终文本;若仍在跑会明确提示用 `wait`/`messages` 跟踪。不需要重跑任务。
@@ -158,11 +161,11 @@ opencode web API 包含 shell / pty / 文件读写接口,**等价于该机器的
 
 | 现象 | 处理 |
 |------|------|
-| `HTTP 401 UnauthorizedError` | 密码不对;确认目标机 `OPENCODE_PASSWORD` 与传入一致 |
+| `HTTP 401 UnauthorizedError` | 密码不对;确认目标机当前 CMD 的 `OPENCODE_SERVER_PASSWORD` 与主控侧 `occtl-servers.json` / `--password` 对应 |
 | `连不上服务器` | 目标机没起 serve / 防火墙未放行 / IP 不对 |
 | `HTTP 404 SessionNotFoundError` | sessionID 不属于该服务器(被删或串机) |
 | `事件流 Ns 无数据` | 网络抖动或目标机卡死;已自动 interrupt,可 `run --session` 续 |
-| `缺少依赖 httpx` | `python3.11 -m pip install httpx` |
+| `缺少依赖 httpx` | `py -3.11 -m pip install httpx` |
 | 目标机忙时被 `--require-idle` 拒绝 | 正常防呆;等 `ps` 里目标机 `running:0` 再派,或去掉开关自行承担并发 |
 
 ## 自检(Windows CMD)
