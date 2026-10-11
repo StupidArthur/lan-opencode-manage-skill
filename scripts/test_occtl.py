@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """occtl.py 的测试:用一个 stdlib 假 opencode 服务器(含 SSE)跑 CLI 子进程。
 
-运行:python3.11 -m unittest discover -s . -p 'test_*.py'
+运行(Windows CMD):py -3.11 -m unittest scripts.test_occtl -v
 """
 
 from __future__ import annotations
