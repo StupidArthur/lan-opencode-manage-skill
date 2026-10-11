@@ -33,11 +33,11 @@ set "OPENCODE_SERVER_PASSWORD=replace-with-strong-password" && opencode serve --
 py -3.11 -m pip install httpx
 
 :: 直连 URL,提供密码(也可以通过 OCCTL_PASSWORD 传入)
-py -3.11 scripts\\occtl.py --server http://192.168.1.11:4096 --password "your-password" info
+py -3.11 scripts\occtl.py --server http://192.168.1.11:4096 --password "your-password" info
 
 :: 多机:复制配置样例到本地不跟踪文件,为各 PC 填写地址、密码、模型
-copy references\\servers.example.json occtl-servers.json
-py -3.11 scripts\\occtl.py --server PC88 info
+copy references\servers.example.json occtl-servers.json
+py -3.11 scripts\occtl.py --server PC88 info
 ```
 
 - 目标机密码建议放在主控侧的 `occtl-servers.json` 中,不同 PC 的密码可不同;该文件不可提交 Git。
