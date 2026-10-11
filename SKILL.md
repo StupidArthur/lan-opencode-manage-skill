@@ -42,7 +42,7 @@ py -3.11 scripts\occtl.py --server PC88 info
 
 - 目标机密码建议放在主控侧的 `occtl-servers.json` 中,不同 PC 的密码可不同;该文件不可提交 Git。
 - 客户端认证优先级: `--password` > `OCCTL_PASSWORD` > 当前 PC 的 registry `password` > `OPENCODE_SERVER_PASSWORD`(兼容末级回退);CLI 登录用户名固定为 `opencode`。
-- `servers` 和 `ps` 中的 `configured_model` 表示绑定配置,不代表当前会话实际使用的模型。
+- `servers` 和 `ps` 的文本输出用 `configured_model:` 表示绑定配置;JSON 结构仍使用 `model` 字段。两者都不代表当前会话实际使用的模型。
 
 常用命令(全部支持 `--json`):
 
