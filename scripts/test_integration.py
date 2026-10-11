@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """真实 opencode 服务器的集成测试(默认跳过,不依赖模拟)。
 
-跑法:
+运行方法(Windows CMD,两个窗口;不要使用 setx):
 
-    OPENCODE_PASSWORD=devpass123 opencode serve --hostname 127.0.0.1 --port 18995 &
+    CMD 窗口 1:
+        set "OPENCODE_SERVER_PASSWORD=devpass123" && opencode serve --hostname 127.0.0.1 --port 18995
 
-    OCCTL_TEST_SERVER=http://127.0.0.1:18995 \
-    OCCTL_TEST_PASSWORD=devpass123 \
-        python3.11 -m unittest test_integration -v
+    CMD 窗口 2:
+        set "OCCTL_TEST_SERVER=http://127.0.0.1:18995" && set "OCCTL_TEST_PASSWORD=devpass123" && py -3.11 -m unittest scripts.test_integration -v
 
 可选变量:
 

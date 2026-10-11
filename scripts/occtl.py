@@ -101,10 +101,12 @@ def resolve_server(args: argparse.Namespace) -> tuple[str, str]:
     if not ref:
         raise CtlError("缺少 --server(URL 或 servers.json 里的名字),或用 OCCTL_SERVER 环境变量")
 
-    password = args.password or os.environ.get("OCCTL_PASSWORD") or os.environ.get("OPENCODE_PASSWORD") or ""
+    # 客户端显式密码优先;OpenCode 服务端变量仅用作兜底,不会覆盖机器清单的独立密码。
+    password = args.password or os.environ.get("OCCTL_PASSWORD") or ""
+    fallback = os.environ.get("OPENCODE_SERVER_PASSWORD") or os.environ.get("OPENCODE_PASSWORD") or ""
 
     if ref.startswith("http://") or ref.startswith("https://"):
-        return ref.rstrip("/"), password
+        return ref.rstrip("/"), password or fallback
 
     entry = load_registry(Path(args.servers).expanduser() if args.servers else default_servers_path()).get(ref)
     if entry is None:
@@ -113,8 +115,27 @@ def resolve_server(args: argparse.Namespace) -> tuple[str, str]:
     if not url:
         raise CtlError(f"服务器 {ref!r} 缺少 url 字段")
     if not password:
-        password = str(entry.get("password", ""))
+        password = str(entry.get("password", "")) or fallback
     return url, password
+
+
+def registry_model(args: argparse.Namespace) -> str:
+    """从 servers.json 读取该机器绑定的模型;直接给 URL 或未配置时返回空串。"""
+    ref = (args.server or os.environ.get("OCCTL_SERVER") or "").strip()
+    if not ref or ref.startswith("http://") or ref.startswith("https://"):
+        return ""
+    path = Path(args.servers).expanduser() if args.servers else default_servers_path()
+    entry = load_registry(path).get(ref) or {}
+    return str(entry.get("model", "")).strip()
+
+
+def effective_model(args: argparse.Namespace) -> str:
+    """新建会话时实际使用的模型。
+
+    优先级:--model > 环境变量 OCCTL_MODEL > servers.json 里该机器的 model。
+    全为空则返回 "",交给目标机 opencode 自己的默认模型兜底。
+    """
+    return (args.model or os.environ.get("OCCTL_MODEL") or registry_model(args) or "").strip()
 
 
 def make_client(base_url: str, password: str, *, read: float = 30.0, connect: float = 10.0) -> httpx.Client:
@@ -442,7 +463,12 @@ def cmd_servers(args: argparse.Namespace) -> int:
     registry = load_registry(path)
     rows = []
     for name, entry in sorted(registry.items()):
-        row: dict[str, Any] = {"name": name, "url": str(entry.get("url", "")).rstrip("/"), "online": None}
+        row: dict[str, Any] = {
+            "name": name,
+            "url": str(entry.get("url", "")).rstrip("/"),
+            "model": str(entry.get("model", "")),
+            "online": None,
+        }
         if args.probe:
             try:
                 with make_client(row["url"], str(entry.get("password", ""))) as client:
@@ -457,26 +483,33 @@ def cmd_servers(args: argparse.Namespace) -> int:
         print(f"# {path or '(未找到 servers.json)'}")
         for row in rows:
             mark = {True: "online", False: "OFFLINE", None: "-"}[row["online"]]
-            print(f"{row['name']:<12} {mark:<8} {row['url']}")
+            print(f"{row['name']:<12} {mark:<8} {row['url']}  configured_model:{row['model'] or '(目标机默认)'}")
     return EXIT_OK
 
 
 def cmd_ps(args: argparse.Namespace) -> int:
     """全队视图:每台机器的在线状态 + 正在跑的会话(管理原语)。"""
-    targets: list[tuple[str, str, str]] = []  # (name, url, password)
+    targets: list[tuple[str, str, str, str]] = []  # (name, url, password, model)
     if args.server or os.environ.get("OCCTL_SERVER"):
         base, pw = resolve_server(args)
-        targets.append((args.server or base, base, pw))
+        targets.append((args.server or base, base, pw, registry_model(args)))
     else:
         registry = load_registry(Path(args.servers).expanduser() if args.servers else default_servers_path())
         if not registry:
             raise CtlError("没有 servers.json;用 --server 指定单台,或先创建 registry(见 references/servers.example.json)")
         for name, entry in sorted(registry.items()):
-            targets.append((name, str(entry.get("url", "")).rstrip("/"), str(entry.get("password", ""))))
+            targets.append(
+                (
+                    name,
+                    str(entry.get("url", "")).rstrip("/"),
+                    str(entry.get("password", "")),
+                    str(entry.get("model", "")),
+                )
+            )
 
     rows = []
-    for name, url, pw in targets:
-        row: dict[str, Any] = {"name": name, "url": url, "online": False, "active": {}}
+    for name, url, pw, model in targets:
+        row: dict[str, Any] = {"name": name, "url": url, "model": model, "online": False, "active": {}}
         try:
             with make_client(url, pw, connect=3.0, read=5.0) as client:
                 row["active"] = unwrap(client.get("/api/session/active")) or {}
@@ -490,11 +523,11 @@ def cmd_ps(args: argparse.Namespace) -> int:
         return EXIT_OK
     for row in rows:
         if not row["online"]:
-            print(f"{row['name']:<12} OFFLINE   {row['url']}")
+            print(f"{row['name']:<12} OFFLINE   {row['url']}   configured_model:{row['model'] or '(目标机默认)'}")
             continue
         act = row["active"]
         detail = "  ".join(act.keys()) if act else "-"
-        print(f"{row['name']:<12} online   running:{len(act):<3} {detail}")
+        print(f"{row['name']:<12} online   running:{len(act):<3} {detail}   configured_model:{row['model'] or '(目标机默认)'}")
     return EXIT_OK
 
 
@@ -526,8 +559,9 @@ def cmd_new(args: argparse.Namespace) -> int:
         body["title"] = args.title
     if args.agent:
         body["agent"] = args.agent
-    if args.model:
-        body["model"] = parse_model_ref(args.model)
+    model = effective_model(args)
+    if model:
+        body["model"] = parse_model_ref(model)
     if not args.no_allow_all:
         body["permissions"] = [{"action": "*", "resource": "*", "effect": "allow"}]
     with make_client(base, pw) as client:
@@ -681,8 +715,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             body["title"] = args.title
         if args.agent:
             body["agent"] = args.agent
-        if args.model:
-            body["model"] = parse_model_ref(args.model)
+        model = effective_model(args)
+        if model:
+            body["model"] = parse_model_ref(model)
         if not args.no_allow_all:
             body["permissions"] = [{"action": "*", "resource": "*", "effect": "allow"}]
         with make_client(base, pw) as client:
@@ -850,7 +885,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="控制局域网内已开启 web 模式(opencode serve)的 opencode",
     )
     parser.add_argument("--server", help="http(s)://host:port 或 servers.json 里的名字(env: OCCTL_SERVER)")
-    parser.add_argument("--password", help="访问密码(env: OCCTL_PASSWORD / OPENCODE_PASSWORD)")
+    parser.add_argument("--password", help="访问密码(env: OCCTL_PASSWORD;直连时亦可用 OPENCODE_SERVER_PASSWORD)")
     parser.add_argument("--servers", help="servers.json 路径(env: OCCTL_SERVERS)")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出(便于脚本/agent 消费)")
     parser.add_argument("--version", action="version", version=f"occtl {VERSION}")
@@ -875,7 +910,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", required=True, help="项目目录(location)")
     p.add_argument("--title")
     p.add_argument("--agent")
-    p.add_argument("--model", help="provider/model[#variant]")
+    p.add_argument(
+        "--model",
+        help="provider/model[#variant];省略则用 servers.json 里该机器的 model,再退到目标机默认",
+    )
     p.add_argument("--no-allow-all", action="store_true", help="不注入'全部允许'权限")
     p.set_defaults(func=cmd_new)
 
@@ -928,7 +966,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-idle", action="store_true", help="目标机有其它会话在跑时拒绝派发(fail-closed;尽力检查,非严格锁)")
     p.add_argument("--title")
     p.add_argument("--agent")
-    p.add_argument("--model", help="provider/model[#variant]")
+    p.add_argument(
+        "--model",
+        help="provider/model[#variant];省略则用 servers.json 里该机器的 model,再退到目标机默认",
+    )
     p.add_argument("--no-allow-all", action="store_true")
     p.add_argument("--timeout", type=float, help="整体超时秒数")
     p.add_argument("--read-timeout", type=float, default=DEFAULT_READ_TIMEOUT)

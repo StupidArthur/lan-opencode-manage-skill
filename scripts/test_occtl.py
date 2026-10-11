@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """occtl.py 的测试:用一个 stdlib 假 opencode 服务器(含 SSE)跑 CLI 子进程。
 
-运行:python3.11 -m unittest discover -s . -p 'test_*.py'
+运行(Windows CMD):py -3.11 -m unittest scripts.test_occtl -v
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import queue
 import re
 import subprocess
@@ -30,6 +31,7 @@ class FakeOpencode:
         self.sessions: dict[str, dict] = {}
         self.active: dict[str, dict] = {}
         self.prompts: list[dict] = []
+        self.create_bodies: list[dict] = []  # 记录 POST /api/session 的请求体
         self.messages: dict[str, list] = {}
         self.subs: list[queue.Queue] = []
         self.interrupts = 0
@@ -141,6 +143,8 @@ class FakeOpencode:
                 path = self._path()
                 if path == "/api/session":
                     body = self._read_json()
+                    with outer.lock:
+                        outer.create_bodies.append(body)
                     if outer.reject_permissions and "permissions" in body:
                         return self._send(400, {"_tag": "InvalidRequestError", "message": "unknown field: permissions"})
                     with outer.lock:
@@ -265,12 +269,13 @@ class FakeOpencode:
             q.put(ev)
 
 
-def run_cli(*argv: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
+def run_cli(*argv: str, timeout: float = 60.0, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(CLI), *argv],
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
 
 
@@ -397,6 +402,110 @@ class OcctlTest(unittest.TestCase):
             r = run_cli("--servers", str(path), "--server", "pc-404", "info")
             self.assertEqual(r.returncode, 1)
             self.assertIn("没有名为", r.stderr)
+
+    def test_registry_model_binding(self):
+        """servers.json 里的 model 成为建会话默认;--model 覆盖它;都没配则不发 model。"""
+        with tempfile.TemporaryDirectory() as td:
+            bound = Path(td) / "bound.json"
+            bound.write_text(
+                json.dumps(
+                    {
+                        "servers": {
+                            "pc-01": {
+                                "url": self.srv.url,
+                                "password": "pw",
+                                "model": "opencode-go/fleet-model",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # (a) 未传 --model → 用 registry 绑定的模型
+            r = run_cli("--servers", str(bound), "--server", "pc-01", "--json", "new", "--dir", "D:/w")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(
+                self.srv.create_bodies[-1]["model"],
+                {"providerID": "opencode-go", "id": "fleet-model"},
+            )
+
+            # (b) 显式 --model 覆盖 registry
+            r = run_cli(
+                "--servers", str(bound), "--server", "pc-01", "--json",
+                "new", "--dir", "D:/w", "--model", "other/override",
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(
+                self.srv.create_bodies[-1]["model"],
+                {"providerID": "other", "id": "override"},
+            )
+
+            # (c) registry 没配 model → 不发 model,交给目标机默认兜底
+            plain = Path(td) / "plain.json"
+            plain.write_text(
+                json.dumps({"servers": {"pc-02": {"url": self.srv.url, "password": "pw"}}}),
+                encoding="utf-8",
+            )
+            r = run_cli("--servers", str(plain), "--server", "pc-02", "--json", "new", "--dir", "D:/w")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("model", self.srv.create_bodies[-1])
+
+    def test_model_env_precedence_and_run_detach(self):
+        """OCCTL_MODEL 覆盖绑定模型, --model 最高优先, run --detach 同样传递模型。"""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "servers.json"
+            path.write_text(
+                json.dumps({"servers": {"pc-01": {
+                    "url": self.srv.url, "password": "pw", "model": "reg/model"
+                }}}), encoding="utf-8"
+            )
+            env = {**os.environ, "OCCTL_MODEL": "env/model"}
+            env.pop("OCCTL_PASSWORD", None)
+            env.pop("OPENCODE_SERVER_PASSWORD", None)
+            env.pop("OPENCODE_PASSWORD", None)
+            r = run_cli(
+                "--servers", str(path), "--server", "pc-01", "--json",
+                "run", "--dir", "D:/w", "--detach", "test environment model",
+                env=env,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.srv.create_bodies[-1]["model"], {
+                "providerID": "env", "id": "model"
+            })
+            r = run_cli(
+                "--servers", str(path), "--server", "pc-01", "--json",
+                "run", "--dir", "D:/w", "--detach", "--model", "cli/model",
+                "test override", env=env,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.srv.create_bodies[-1]["model"], {
+                "providerID": "cli", "id": "model"
+            })
+
+    def test_open_code_server_password_env_direct_url(self):
+        """直连 URL 允许复用 CMD 当前会话中的 OPENCODE_SERVER_PASSWORD。"""
+        env = dict(os.environ)
+        for key in ("OCCTL_PASSWORD", "OPENCODE_PASSWORD"):
+            env.pop(key, None)
+        env["OPENCODE_SERVER_PASSWORD"] = "pw"
+        r = run_cli("--server", self.srv.url, "--json", "info", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_registry_password_before_server_env(self):
+        """管理多台 PC 时,机内 registry 密码优先于管理侧本地服务端密码。"""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "servers.json"
+            path.write_text(json.dumps({"servers": {"pc-01": {
+                "url": self.srv.url, "password": "pw"
+            }}}), encoding="utf-8")
+            env = dict(os.environ)
+            env.pop("OCCTL_PASSWORD", None)
+            env["OPENCODE_SERVER_PASSWORD"] = "different-local-password"
+            r = run_cli(
+                "--servers", str(path), "--server", "pc-01", "--json", "info",
+                env=env,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_ps_fleet_view(self):
         with self.srv.lock:

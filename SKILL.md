@@ -1,44 +1,55 @@
 ---
 name: OpenCode LAN
-description: 通过 HTTP API 遥控局域网内已开启 web 模式(opencode serve)的 opencode:探活、列/建/删会话、发任务并流式回显、多轮续用、打断。当需要驱动另一台 PC 上的 opencode,或查看/继续它的会话时使用。
+description: 通过 HTTP API 遥控局域网内在 Windows CMD 启动 opencode web 或 opencode serve 的 OpenCode V2:探活、列/建/删会话、发任务并流式回显、多轮续用、打断。当需要驱动另一台 PC 上的 opencode,或查看/继续它的会话时使用。
 ---
 
 # OpenCode LAN
 
-用 `scripts/occtl.py`(Python 3.11 + httpx)控制局域网里以 `opencode serve` 运行的 opencode。
-适用场景:Manager/助手远程驱动各台 PC 上的 opencode 干活;查看并续用某台机器上已有的会话。
+用 `scripts/occtl.py`(Python 3.11 + httpx)控制局域网里运行 `opencode web`(Web UI + API)或 `opencode serve`(仅 API)的 OpenCode V2。
+适用场景:Manager/助手远程驱动各台 Windows PC 上的 opencode 干活;查看并续用某台机器上已有的会话。
 
-## 前置:目标 PC 已开启 web 模式
+## 前置:目标 PC 已通过 CMD 启动 OpenCode V2
+
+在每台工作机的 Windows **CMD** 中启动(密码只写入**当前 CMD 会话**,不配置 Windows 用户级或系统级环境变量):
 
 ```bat
-:: 固定密码(不设则每次启动随机生成)+ 绑定到局域网
-set OPENCODE_PASSWORD=<强密码>
-opencode serve --hostname 0.0.0.0 --port 4096
+:: 需要 Web 界面:浏览器 + HTTP API
+set "OPENCODE_SERVER_PASSWORD=replace-with-strong-password" && opencode web --hostname 0.0.0.0 --port 4096
 
-:: 防火墙放行一次(管理员)
-netsh advfirewall firewall add rule name="opencode-web" dir=in action=allow protocol=TCP localport=4096
+:: 只需要 API:使用下面这行代替上面那行,不要同时运行
+set "OPENCODE_SERVER_PASSWORD=replace-with-strong-password" && opencode serve --hostname 0.0.0.0 --port 4096
 ```
 
-验证:`curl -u opencode:<密码> http://<PC-IP>:4096/api/info` 返回 `{"version":...}` 即通。
+- 官方服务端密码变量是 `OPENCODE_SERVER_PASSWORD`,**不是** `OPENCODE_PASSWORD`。不需要通过 `setx` 或系统控制面板保存密码。
+- 默认用户名为 `opencode`（本工具也固定使用此用户名）,无需设置 `OPENCODE_SERVER_USERNAME`;如已有非默认值,可在当前 CMD 用 `set "OPENCODE_SERVER_USERNAME="` 清除。
+- `set` 只影响当前 CMD 和它启动的子进程;关闭窗口后不持久保存。服务结束后可执行 `set "OPENCODE_SERVER_PASSWORD="` 清除该窗口的变量。
+- 首次可在管理员 CMD 限制性放行局域网来源: `netsh advfirewall firewall add rule name="opencode-web" dir=in action=allow protocol=TCP localport=4096 remoteip=localsubnet`
+- 验证（提示输入密码）: `curl.exe -u opencode http://<PC-IP>:4096/api/info`。
+- HTTP API 具有命令执行与文件访问能力,仅在可信局域网使用,不可开放公网。
 
-## 用法
+## 用法(Windows CMD)
 
-```sh
-python3.11 -m pip install httpx        # 首次
+```bat
+py -3.11 -m pip install httpx
 
-# 直连 URL(密码也可走 OCCTL_PASSWORD / OPENCODE_PASSWORD 环境变量)
-python3.11 scripts/occtl.py --server http://192.168.1.11:4096 --password "$PW" info
+:: 直连 URL,提供密码(也可以通过 OCCTL_PASSWORD 传入)
+py -3.11 scripts\occtl.py --server http://192.168.1.11:4096 --password "your-password" info
 
-# 多台机器:复制 references/servers.example.json 为 occtl-servers.json(或 ~/.config/occtl/servers.json)
-python3.11 scripts/occtl.py --server PC88 info
+:: 多机:复制配置样例到本地不跟踪文件,为各 PC 填写地址、密码、模型
+copy references\servers.example.json occtl-servers.json
+py -3.11 scripts\occtl.py --server PC88 info
 ```
+
+- 目标机密码建议放在主控侧的 `occtl-servers.json` 中,不同 PC 的密码可不同;该文件不可提交 Git。
+- 客户端认证优先级: `--password` > `OCCTL_PASSWORD` > 当前 PC 的 registry `password` > `OPENCODE_SERVER_PASSWORD`(兼容末级回退);CLI 登录用户名固定为 `opencode`。
+- `servers` 和 `ps` 的文本输出用 `configured_model:` 表示绑定配置;JSON 结构仍使用 `model` 字段。两者都不代表当前会话实际使用的模型。
 
 常用命令(全部支持 `--json`):
 
 | 命令 | 说明 |
 |------|------|
 | `info` | 探活/服务信息 |
-| `servers [--probe]` | 列出 servers.json 里的机器 |
+| `servers [--probe]` | 列出 servers.json 里的机器(含各自绑定的模型) |
 | `ps` | **全队视图**:每台在线状态 + 正在跑的会话(管理入口) |
 | `ls [--dir D:/w] [--limit N]` | 会话列表(含 outcome) |
 | `run --dir D:/w "任务"` | **新建会话**跑任务,流式输出,等结束 |
@@ -52,15 +63,15 @@ python3.11 scripts/occtl.py --server PC88 info
 
 ### 跑任务的典型流程
 
-```sh
-# 1) 新建并跑(输出:会话 id 在 stderr,正文流式打到 stdout)
-python3.11 scripts/occtl.py --server PC88 --json run --dir D:/work/project-a "确认仓库 origin 与基准 SHA,只在本机固定分支 PC88 上修改 render/config.yaml 到 4K/30fps"
-# => {"sessionID":"ses_xxx","status":"succeeded","text":"..."}
+```bat
+:: 1) 新建并跑(输出:会话 id 在 stderr,正文流式打到 stdout)
+py -3.11 scripts\occtl.py --server PC88 --json run --dir D:/work/project-a "确认仓库 origin 与基准 SHA,只在本机固定分支 PC88 上修改 render/config.yaml 到 4K/30fps"
+:: => {"sessionID":"ses_xxx","status":"succeeded","text":"..."}
 
-# 2) 用上一步的 sessionID 续一轮(上下文保留)
-python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行测试,只提交并推送 PC88 分支;返回 Commit SHA 与测试结果;等待主控验收"
+:: 2) 用上一步的 sessionID 续一轮(上下文保留)
+py -3.11 scripts\occtl.py --server PC88 --json run --session ses_xxx "运行测试,只提交并推送 PC88 分支;返回 Commit SHA 与测试结果;等待主控验收"
 
-# 3) 会话不删会一直留在该 PC 的 opencode 里,可随时 ls 找到、get 查看、rm 删除
+:: 3) 会话不删会一直留在该 PC 的 opencode 里,可随时 ls 找到、get 查看、rm 删除
 ```
 
 - `--dir` 必须是**目标 PC 上的路径**(如 `D:/work/project-a`),不要用本机路径。
@@ -77,8 +88,9 @@ python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行�
 
 ### 数据结构
 
-- `servers.json`(本仓库根目录或 `~/.config/occtl/servers.json`):机器名 → url/password。**唯一机器清单**,机器名采用 `PC` + IPv4 末段(如 `PC88` → `192.168.1.88`);大小写固定,即该机器在每个项目仓库的分支名。
-- 当前项目任务台账(建议放在管理侧该项目的 `.ocmanage/tasks.jsonl`,加入 `.gitignore` 避免提交),每行一条:
+- `servers.json`(本仓库根目录或 `~/.config/occtl/servers.json`):机器名 → `url` / `password` / **`model`**。**唯一机器清单**,机器名采用 `PC` + IPv4 末段(如 `PC88` → `192.168.1.88`);大小写固定,即该机器在每个项目仓库的分支名。
+- **`model` 是每台机器的绑定模型**(如 `opencode-go/deepseek-v4.1-flash`)。机队里各机用不同模型,是为了把有限的 token plan 摊到 N 台机器上。`occtl` 新建会话时按 `--model` > `OCCTL_MODEL` > 该机 `model` 的顺序取值;**三者都没有则不发送模型字段,由目标机 opencode 自己选择默认模型**。绑定不同模型需要各机器具备对应的提供商凭据/配额。
+- 当前项目任务台账(建议放在管理侧该项目的 `.ocmanage/tasks.jsonl`,并加入**该项目仓库根目录**的 `.gitignore` 避免提交;本 Skill 自带的 `.gitignore` 不作用于其他仓库),每行一条:
 
   ```json
   {"jobId":"20261009-01","pc":"PC88","sessionID":"ses_x","dir":"D:/work/project-a","baseSha":"<sha>","branch":"PC88","commit":null,"prompt":"...","state":"dispatched","createdAt":1791549000000,"endedAt":null,"summary":null}
@@ -101,22 +113,26 @@ python3.11 scripts/occtl.py --server PC88 --json run --session ses_xxx "运行�
 
 ### 派活(不阻塞)
 
-```sh
-python3.11 scripts/occtl.py ps                                   # 1) 先看哪台空闲
-python3.11 scripts/occtl.py --server PC88 --json run --detach \
-    --require-idle --dir D:/work/project-a "仅在 PC88 分支工作;完成后 push PC88,不得合并" # 2) 派发
-# 3) 立刻把 {jobId, pc, sessionID, dir, baseSha, branch, prompt} 写入当前项目台账
+```bat
+:: 1) 先看哪台空闲
+py -3.11 scripts\occtl.py ps
+:: 2) 派发
+py -3.11 scripts\occtl.py --server PC88 --json run --detach --require-idle --dir D:/work/project-a "仅在 PC88 分支工作;完成后 push PC88,不得合并"
+:: 模型不用在命令行写:--server PC88 创建新 session 时自动使用机器清单绑定的 model;续用旧 session 不重选模型
+:: 3) 立刻把 {jobId, pc, sessionID, dir, baseSha, branch, prompt} 写入当前项目台账
 ```
 
 `--require-idle` 是程序级防呆:派发前先查目标机 `/api/session/active`,有其它会话在跑就直接拒绝(exit 1);这是尽力检查,不是跨管理机的原子锁。
 
 ### 盯梢
 
-```sh
-python3.11 scripts/occtl.py ps                                   # 全队:谁在跑
-python3.11 scripts/occtl.py --server PC88 --json messages ses_x --limit 5
-# → 看 newest assistant 文本与 idle.outcome 判断 done/failed
-python3.11 scripts/occtl.py --server PC88 run --session ses_x "..."  # 需要时续轮
+```bat
+:: 全队:谁在跑
+py -3.11 scripts\occtl.py ps
+py -3.11 scripts\occtl.py --server PC88 --json messages ses_x --limit 5
+:: → 看 newest assistant 文本与 idle.outcome 判断 done/failed
+:: 需要时续轮
+py -3.11 scripts\occtl.py --server PC88 run --session ses_x "..."
 ```
 
 `run/prompt --wait` 的事件流被掐断时,occtl 会**自动向服务器对账**:查会话 `outcome`(succeeded/failed/interrupted)并补回最终文本;若仍在跑会明确提示用 `wait`/`messages` 跟踪。不需要重跑任务。
@@ -139,26 +155,34 @@ opencode web API 包含 shell / pty / 文件读写接口,**等价于该机器的
 
 - 仅在**可信内网**使用,绝不要把 4096 端口映射到公网;
 - 密码必须强,优先用环境变量传递,不要写进脚本或聊天记录;
-- 不需要时把目标机的 `opencode serve` 停掉。
+- 不需要时把目标机的 `opencode web` / `opencode serve` 停掉。
 
 ## 排障
 
 | 现象 | 处理 |
 |------|------|
-| `HTTP 401 UnauthorizedError` | 密码不对;确认目标机 `OPENCODE_PASSWORD` 与传入一致 |
+| `HTTP 401 UnauthorizedError` | 密码不对;确认目标机当前 CMD 的 `OPENCODE_SERVER_PASSWORD` 与主控侧 `occtl-servers.json` / `--password` 对应 |
 | `连不上服务器` | 目标机没起 serve / 防火墙未放行 / IP 不对 |
 | `HTTP 404 SessionNotFoundError` | sessionID 不属于该服务器(被删或串机) |
 | `事件流 Ns 无数据` | 网络抖动或目标机卡死;已自动 interrupt,可 `run --session` 续 |
-| `缺少依赖 httpx` | `python3.11 -m pip install httpx` |
+| `缺少依赖 httpx` | `py -3.11 -m pip install httpx` |
 | 目标机忙时被 `--require-idle` 拒绝 | 正常防呆;等 `ps` 里目标机 `running:0` 再派,或去掉开关自行承担并发 |
 
-## 自检
+## 自检(Windows CMD)
 
-```sh
-# 单元测试(假 opencode + SSE,不需要真实环境;20 个用例)
-python3.11 -m unittest scripts.test_occtl -v
+```bat
+:: 单元测试(假 OpenCode + SSE,无需目标机器)
+py -3.11 -m unittest scripts.test_occtl -v
+```
 
-# 真实服务器集成测试(起一个 opencode serve 后;默认跳过)
-OCCTL_TEST_SERVER=http://127.0.0.1:18995 OCCTL_TEST_PASSWORD=$PW \
-    python3.11 -m unittest scripts.test_integration -v
+真实服务器集成测试:在 CMD 窗口 1 启动本地测试服务器:
+
+```bat
+set "OPENCODE_SERVER_PASSWORD=replace-with-test-password" && opencode serve --hostname 127.0.0.1 --port 18995
+```
+
+在 CMD 窗口 2 测试:
+
+```bat
+set "OCCTL_TEST_SERVER=http://127.0.0.1:18995" && set "OCCTL_TEST_PASSWORD=replace-with-test-password" && py -3.11 -m unittest scripts.test_integration -v
 ```
